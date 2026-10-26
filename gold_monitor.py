@@ -1,0 +1,2376 @@
+# -*- coding: utf-8 -*-
+"""
+工银积存金价格监控（桌面右下角弹窗提醒）
+
+数据来源：中国工商银行公开行情接口（无需登录）
+- 积存金：POST /servlet/AsynGetDataServlet  tranCode=A00622
+- 账户黄金 / Au99.99 / 如意金积存：同一接口不同 tranCode（见 SOURCES）
+
+提醒规则：价格每向下穿越一个整数档位（默认 10 元一档，如 900→890→880），
+在屏幕右下角弹出提醒窗口；价格回升重新跌破时会再次提醒。
+"""
+
+import json
+import math
+import os
+import ssl
+import sys
+import threading
+import time
+import urllib.request
+import urllib.parse
+from datetime import datetime, timedelta
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+# ---------- 全局常量 ----------
+
+APP_NAME = "积存金价格监控"
+# 打包成 exe（PyInstaller frozen）后，__file__ 指向临时解压目录，配置写那里会丢；
+# 故冻结时改用 exe 所在目录，使 config.json / price_history.json 与 exe 放在一起。
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+# 本地分时行情（工行无公开历史分时接口，只能程序运行期间自行采集累积）
+HISTORY_PATH = os.path.join(BASE_DIR, "price_history.json")
+HISTORY_KEEP_DAYS = 15      # 本地分时最多保留的交易日数
+HISTORY_MAX_POINTS = 900    # 每个交易日最多点数（按分钟去重，全天约 800 个）
+
+ICBC_SERVLET = "https://icbcphp.icbc.com.cn/servlet/AsynGetDataServlet"
+PAPI_PRODUCT_LIST = "https://papi.icbc.com.cn/wapDynamicPage/goldMarket/productList"
+
+# 在线趋势数据：东方财富公开行情（免鉴权）。上金所黄金9999（Au99.99）与积存金同源，
+# 走势基本重合（点差通常 0~1 元/克），提供当日分时与多年日K，无需本机常驻采集。
+EM_TRENDS_URL = ("https://push2his.eastmoney.com/api/qt/stock/trends2/get"
+                 "?secid=118.AU9999&fields1=f1,f2,f3,f4,f5,f6,f7,f8"
+                 "&fields2=f51,f52,f53&iscr=0&iscca=0&ndays=1")
+EM_KLINE_URL = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
+                "?secid=118.AU9999&fields1=f1,f2,f3,f4,f5,f6"
+                "&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=0"
+                "&beg={beg}&end={end}&lmt=1000000")
+EM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+              "Referer": "https://quote.eastmoney.com/"}
+EM_TRENDS_TTL = 60     # 分时缓存秒数（交易时段内 1 分钟刷新一次即可）
+EM_KLINE_TTL = 1800    # 日K缓存秒数
+
+# 工行老站点使用旧版 TLS 重协商，OpenSSL 3 默认拒绝，需要显式放开
+SSL_CONTEXT = ssl.create_default_context()
+SSL_CONTEXT.options |= 0x4  # ssl.OP_LEGACY_SERVER_CONNECT
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://icbcphp.icbc.com.cn/icbc/newperbank/perbank3/gold/frame_acgold_index_out.jsp",
+    "X-Requested-With": "XMLHttpRequest",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+}
+
+# 可选监控品种：key -> (显示名, 取数函数名, 价格字段说明)
+# price_field 由取数结果决定，此处仅声明界面可选字段
+SOURCES = {
+    "jicun_active": {"name": "积存金 · 主动积存买入价", "unit": "元/克"},
+    "jicun_sell":   {"name": "积存金 · 赎回价",       "unit": "元/克"},
+    "ruyi_active":  {"name": "如意金积存 · 买入价",   "unit": "元/克"},
+    "ruyi_sell":    {"name": "如意金积存 · 卖出价",   "unit": "元/克"},
+    "account_buy":  {"name": "人民币账户黄金 · 买入价", "unit": "元/克"},
+    "account_sell": {"name": "人民币账户黄金 · 卖出价", "unit": "元/克"},
+    "au9999":       {"name": "上金所 Au99.99",        "unit": "元/克"},
+}
+
+DEFAULT_CONFIG = {
+    "source": "jicun_active",   # 监控品种
+    "step": 10.0,               # 档位间隔（元）
+    "interval": 10,             # 轮询间隔（秒），积存金官方约 3 秒刷新
+    "sound": True,              # 提醒时播放提示音
+    "autostart": False,         # 开机自启（Windows）
+    "last_price": None,         # 上次价格（内部用）
+    # 我的持仓（工银积存金，按赎回价估值）；分发版本默认空，首次使用在“编辑”中填写
+    "hold_grams": 0.0,          # 持有克数
+    "hold_cost": 0.0,           # 累计投入成本（元）
+    "today_base": None,         # 今日盈亏基准价（元/克）
+    "today_base_date": None,    # 基准价所属交易日；跨日后自动滚动
+    "last_close": None,         # 最近记录的交易日最后赎回价
+    "last_close_date": None,
+    # 补仓明细（工银App交易记录，买入价=金额/克数由程序倒算）
+    "trades": [],
+    "privacy": False,           # 隐私模式：隐藏持仓克数/金额/盈亏（小眼睛）
+}
+
+# 个人积存金赎回（卖出变现）手续费率：赎回金额的 0.5%（工行 2017-03-01 起，
+# 2026-08-28 阶段性优惠公告明确该费率保持 0.5% 不变）
+REDEEM_FEE_RATE = 0.005
+
+
+# ---------- 数据抓取 ----------
+
+def _post_trancode(tran_code, extra=None, timeout=10):
+    data = {"tranCode": tran_code}
+    if extra:
+        data.update(extra)
+    body = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(ICBC_SERVLET, data=body, headers=HEADERS, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as resp:
+        raw = resp.read()
+    for enc in ("utf-8", "gbk"):
+        try:
+            return json.loads(raw.decode(enc))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+    raise RuntimeError("行情返回内容无法解析")
+
+
+def fetch_prices():
+    """
+    返回 dict：各品种当前价，以及附加信息（最高/最低/时间）。
+    任何网络异常向上抛出，由调用方处理。
+    """
+    result = {"time": datetime.now().strftime("%H:%M:%S")}
+
+    # 1) 积存金 A00622
+    try:
+        d = _post_trancode("A00622")
+        rf = (d.get("rf") or [{}])[0]
+        result["jicun_active"] = float(rf.get("ActivePrice") or 0) or None
+        result["jicun_sell"] = float(rf.get("SellPrice") or 0) or None
+        result["high"] = float(rf.get("HighPrice") or 0) or None
+        result["low"] = float(rf.get("LowPrice") or 0) or None
+        result["date"] = rf.get("RegDate", "")
+    except Exception:
+        pass
+
+    # 2) 如意金积存 A00505（价格单位 0.01 元）
+    try:
+        d = _post_trancode("A00505")
+        p = (d.get("pronoinfo") or [{}])[0]
+        bp = float(p.get("buyprice") or 0)
+        sp = float(p.get("sellprice") or 0)
+        result["ruyi_active"] = bp / 100.0 if bp else None
+        result["ruyi_sell"] = sp / 100.0 if sp else None
+    except Exception:
+        pass
+
+    # 3) 人民币账户黄金 A00500
+    try:
+        d = _post_trancode(
+            "A00500",
+            {"Area_code": "0200", "trademode": "1", "proIdsIn": "", "isFirstTime": "1"},
+        )
+        market = d.get("market") or []
+        for m in market:
+            if m.get("metalname") == "人民币账户黄金":
+                result["account_buy"] = float(m.get("buyprice") or 0) or None
+                result["account_sell"] = float(m.get("sellprice") or 0) or None
+                break
+    except Exception:
+        pass
+
+    # 4) 上金所 Au99.99（m 站公开接口）
+    try:
+        url = PAPI_PRODUCT_LIST + "?type=0"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": HEADERS["User-Agent"],
+                "Referer": "https://m.icbc.com.cn/",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10, context=SSL_CONTEXT) as resp:
+            d = json.loads(resp.read().decode("utf-8"))
+        for it in d.get("data") or []:
+            if it.get("id") == "Au99.99":
+                result["au9999"] = float(it.get("newPrice") or 0) or None
+                break
+    except Exception:
+        pass
+
+    return result
+
+
+# ---------- 配置 ----------
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+# ---------- 本地分时行情采集 ----------
+
+def load_history():
+    """读取本地分时数据：{交易日: [["HH:MM", 价格], ...]}，按交易日升序。"""
+    try:
+        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {d: [[t, float(p)] for t, p in pts]
+                for d, pts in sorted(data.items()) if isinstance(pts, list)}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def save_history(hist):
+    """按日期裁剪保留最近 N 个交易日后落盘。"""
+    trimmed = dict(sorted(hist.items())[-HISTORY_KEEP_DAYS:])
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(trimmed, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def append_history_point(hist, day, hm, price):
+    """追加一个分时点：同分钟去重（保留最新价），同日限长，返回是否发生变更。"""
+    if not day or not price:
+        return False
+    pts = hist.setdefault(day, [])
+    if pts and pts[-1][0] == hm:
+        if pts[-1][1] != price:
+            pts[-1][1] = price
+            return True
+        return False
+    pts.append([hm, float(price)])
+    if len(pts) > HISTORY_MAX_POINTS:
+        del pts[:len(pts) - HISTORY_MAX_POINTS]
+    return True
+
+
+def in_trade_session(hm):
+    """积存金交易时段：周一至周五 9:10-22:30（节假日无法本地判断，由接口有无报价兜底）。"""
+    return "09:10" <= hm <= "22:30"
+
+
+def trade_minutes():
+    """交易时段总分钟数（9:10-22:30 连续计时，与支付宝分时横轴一致）。"""
+    return (22 * 60 + 30) - (9 * 60 + 10)
+
+
+# ---------- 在线趋势行情（东方财富 · 上金所黄金9999，免鉴权） ----------
+
+def _get_em_json(url, timeout=10, retries=6):
+    """取东财 JSON。该行情域边缘节点对高频访问会直接掐 TCP（RemoteDisconnected，
+    属 ConnectionResetError），多节点轮询下时好时坏（实测约 1/8 放行），
+    故对连接类错误做几次短退避重试；HTTP 错误响应（403/429 等）不重试。"""
+    last_err = None
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=EM_HEADERS)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", "ignore"))
+        except (ConnectionError, TimeoutError) as e:
+            last_err = e
+            if i < retries - 1:
+                time.sleep(0.35 * (i + 1))
+    raise last_err
+
+
+def fetch_em_trends():
+    """
+    黄金9999最新会话分时（东财交易日=前一夜盘20:00-次日2:30 + 当日白盘，
+    周一的会话还含周五夜盘）。
+    返回 {"date": 东财交易日(夜盘起始日), "pre_close": 昨收,
+          "points": [["YYYY-MM-DD HH:MM", 价格], ...]}（保留完整时间戳，
+          由渲染方按自然日与积存金时段 9:00-15:30/20:00-22:30 自行过滤）。
+    只保留价格大于 0 的分钟点（集合竞价/无成交时段会出现 0 值）。
+    """
+    d = (_get_em_json(EM_TRENDS_URL) or {}).get("data") or {}
+    pts = []
+    for row in d.get("trends") or []:
+        seg = row.split(",")
+        if len(seg) < 2:
+            continue
+        try:
+            p = float(seg[1])  # f52 分钟成交价（seg[2] f53 为分钟均价）
+        except (TypeError, ValueError):
+            continue
+        if p > 0 and len(seg[0]) >= 16:
+            pts.append([seg[0][:16], p])
+    date = d.get("date") or (d.get("trends") or [""])[0][:10]
+    return {"date": date, "pre_close": d.get("preClose"),
+            "name": d.get("name") or "黄金9999", "points": pts}
+
+
+def fetch_em_daily(beg, end):
+    """
+    黄金9999历史日K，beg/end 为 "YYYYMMDD"。
+    返回 [["YYYY-MM-DD", 开, 收, 高, 低], ...]（均为 float）。
+    """
+    d = (_get_em_json(EM_KLINE_URL.format(beg=beg, end=end)) or {}).get("data") or {}
+    out = []
+    for row in d.get("klines") or []:
+        seg = row.split(",")
+        if len(seg) < 6:
+            continue
+        try:
+            out.append([seg[0]] + [float(x) for x in seg[1:5]])  # 开/收/高/低
+        except ValueError:
+            continue
+    return out
+
+
+# ---------- 开机自启（Windows 注册表） ----------
+
+def _run_key():
+    import winreg
+    return winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        0,
+        winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+    )
+
+
+def set_autostart(enable):
+    if not sys.platform.startswith("win"):
+        return False
+    import winreg
+    try:
+        key = _run_key()
+        if enable:
+            exe = sys.executable
+            if getattr(sys, "frozen", False):
+                cmd = f'"{exe}"'
+            else:
+                cmd = f'"{exe}" "{os.path.join(BASE_DIR, "gold_monitor.py")}"'
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+        return True
+    except OSError:
+        return False
+
+
+# ---------- 档位检测 ----------
+
+def crossed_tiers(prev_price, price, step):
+    """
+    返回价格从 prev_price 跌到 price 过程中向下穿越的所有档位线（降序）。
+    档位线为 step 的整数倍：step=10 时即 ...900, 890, 880...
+    """
+    if prev_price is None or price is None or price >= prev_price:
+        return []
+    crossed = []
+    k_hi = math.floor(prev_price / step)
+    k_lo = math.ceil(price / step)
+    # 严格穿越：档位线 t 满足 price <= t < prev_price
+    for k in range(k_hi, k_lo - 1, -1):
+        t = k * step
+        if price <= t < prev_price:
+            crossed.append(t)
+    return crossed
+
+
+# ---------- 右下角提醒弹窗 ----------
+
+class ToastManager:
+    WIDTH = 340
+    HEIGHT = 150
+    MARGIN = 16
+    GAP = 12
+
+    def __init__(self, root):
+        self.root = root
+        self.active = []  # 由下往上排列
+
+    def _work_area(self):
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        try:
+            self.root.attributes("-alpha", 0)  # 确保窗口已映射以便取工作区
+        except tk.TclError:
+            pass
+        return sw, sh
+
+    def show(self, title, message, tag=None, duration_ms=12000):
+        """在主线程调用。"""
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+
+        frame = tk.Frame(win, bg="#ffffff", highlightbackground="#c7000b",
+                         highlightthickness=1, bd=0)
+        frame.pack(fill="both", expand=True)
+
+        top = tk.Frame(frame, bg="#c7000b", height=30)
+        top.pack(fill="x")
+        tk.Label(top, text=title, bg="#c7000b", fg="#ffffff",
+                font=("Microsoft YaHei UI", 10, "bold")).pack(side="left", padx=10, pady=4)
+        close = tk.Label(top, text="✕", bg="#c7000b", fg="#ffffff",
+                         font=("Microsoft YaHei UI", 9), cursor="hand2")
+        close.pack(side="right", padx=8)
+
+        body = tk.Label(frame, text=message, bg="#ffffff", fg="#222222",
+                        font=("Microsoft YaHei UI", 11), justify="left", anchor="w")
+        body.pack(fill="both", expand=True, padx=12, pady=8)
+
+        self.active.append(win)
+        self._relayout(sw, sh)
+
+        def fade_in(i=0):
+            try:
+                win.attributes("-alpha", min(1.0, i / 8))
+            except tk.TclError:
+                return
+            if i < 8:
+                win.after(15, lambda: fade_in(i + 1))
+
+        def dismiss(_=None):
+            if win not in self.active:
+                return
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            if win in self.active:
+                self.active.remove(win)
+            self._relayout(sw, sh)
+
+        close.bind("<Button-1>", dismiss)
+        win.bind("<Button-1>", dismiss)
+        fade_in()
+        win.after(duration_ms, dismiss)
+
+    def _relayout(self, sw, sh):
+        for idx, w in enumerate(self.active):
+            x = sw - self.WIDTH - self.MARGIN
+            y = sh - self.HEIGHT - self.MARGIN - idx * (self.HEIGHT + self.GAP)
+            try:
+                w.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+            except tk.TclError:
+                pass
+
+
+# ---------- 走势图标签防碰撞布局 ----------
+
+class _ChartLabels:
+    """走势图“点 + 文字标签”防碰撞布局。
+    - 锚点横向邻近的拥挤标签归为一簇，统一拉到左/右边缘成列、纵向排开，
+      用短直角（elbow）引线连回各自的点（金融图惯例）；
+    - 稀疏标签就近贴在点旁，一条短引线连点；
+    - 布局避让 reserve 预留区（最新价价签、持仓成本标签等）。
+    用法：add() 依次加入标签锚点 -> flush() 统一绘制引线、胶囊。"""
+
+    PAD_X, PAD_Y, GAP = 5, 3, 4  # 胶囊内边距 / 标签最小间距
+    DOT_R = 6                    # 锚点圆点避让半径（点实际 3.6~4.5）
+    EDGE_GAP = 6                 # 就近标签与锚点的间距
+    NEAR_DX = 110                # 锚点横向距离小于此值的标签可能归入同一标注列
+
+    def __init__(self, cv, L, R, T, B, reserve=None):
+        self.cv, self.L, self.R, self.T, self.B = cv, L, R, T, B
+        self.items = []
+        self.placed = [tuple(b) for b in (reserve or [])]  # (x1, y1, x2, y2)
+
+    def _measure(self, text, font):
+        tid = self.cv.create_text(-999, -999, text=text, font=font)
+        x1, y1, x2, y2 = self.cv.bbox(tid)
+        self.cv.delete(tid)
+        return x2 - x1, y2 - y1
+
+    def add(self, mx, my, text, kind="buy"):
+        """kind: buy=买点（橙） / gold=高低点（金）"""
+        font = ("Microsoft YaHei UI", 8)
+        tw, th = self._measure(text, font)
+        w, h = tw + self.PAD_X * 2, th + self.PAD_Y * 2
+        self.items.append({"mx": mx, "my": my, "text": text, "kind": kind,
+                           "font": font, "w": w, "h": h,
+                           "dot": (mx - self.DOT_R, my - self.DOT_R,
+                                   mx + self.DOT_R, my + self.DOT_R)})
+
+    @staticmethod
+    def _overlap(a, b):
+        return not (a[2] <= b[0] + _ChartLabels.GAP or b[2] <= a[0] + _ChartLabels.GAP
+                    or a[3] <= b[1] + _ChartLabels.GAP or b[3] <= a[1] + _ChartLabels.GAP)
+
+    def flush(self):
+        # 1) 按锚点 x 单链接聚类：横向邻近（< NEAR_DX）的标签归为同一拥挤簇
+        order_x = sorted(range(len(self.items)), key=lambda k: self.items[k]["mx"])
+        clusters = []  # 每项是成员下标列表
+        for k in order_x:
+            if clusters and self.items[k]["mx"] - self.items[clusters[-1][-1]]["mx"] < self.NEAR_DX:
+                clusters[-1].append(k)
+            else:
+                clusters.append([k])
+
+        # 2) 成员 >=2 的簇拉到边缘成列；单点簇稍后就近排布
+        crowded = [c for c in clusters if len(c) >= 2]
+        singles = [c[0] for c in clusters if len(c) == 1]
+        for members in sorted(crowded, key=lambda c: -len(c)):
+            self._place_column(members)
+
+        # 3) 单点（通常是区间高低点）就近贴点排布，避让已放列与预留区
+        for k in sorted(singles,
+                        key=lambda j: (self.items[j]["kind"] != "gold", self.items[j]["my"])):
+            self._place_near(k)
+
+        self._draw_leaders()
+        # 锚点圆点画在引线之上、胶囊之下：落在标签带内的点会被不透明胶囊自然遮住
+        for it in self.items:
+            r, color = (4.5, "#ff8a00") if it["kind"] == "buy" else (3.6, "#c9a04e")
+            mx, my = it["mx"], it["my"]
+            self.cv.create_oval(mx - r, my - r, mx + r, my + r,
+                                fill=color, outline="#ffffff", width=1.6)
+        for it in self.items:
+            x1, y1, x2, y2 = it["box"]
+            if it["kind"] == "buy":
+                fill, outline, tcolor = "#fff7ef", "#f3c89b", "#c2570a"
+            else:
+                fill, outline, tcolor = "#fbf6e9", "#e3d0a0", "#8a6d2b"
+            self.cv.create_rectangle(x1, y1, x2, y2, fill=fill, outline=outline)
+            self.cv.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=it["text"],
+                                fill=tcolor, font=it["font"])
+
+    def _place_column(self, members):
+        """拥挤簇：统一拉到左/右边缘成一列，纵向等距排开并避让预留区。"""
+        members = sorted(members, key=lambda k: self.items[k]["my"])
+        wmax = max(self.items[k]["w"] for k in members)
+        total_h = sum(self.items[k]["h"] for k in members) + self.GAP * (len(members) - 1)
+        mean_my = sum(self.items[k]["my"] for k in members) / len(members)
+        mean_mx = sum(self.items[k]["mx"] for k in members) / len(members)
+        side = "r" if mean_mx >= (self.L + self.R) / 2 else "l"
+
+        # 列横向盒：右侧右对齐到 R-2，左侧左对齐到 L+2
+        if side == "r":
+            cx1, cx2 = self.R - 2 - wmax, self.R - 2
+        else:
+            cx1, cx2 = self.L + 2, self.L + 2 + wmax
+
+        # 与列横交的预留区转为禁占 y 段
+        banned = [(b[1], b[3]) for b in self.placed
+                  if b[0] < cx2 - self.GAP and cx1 + self.GAP < b[2]]
+        top = min(max(mean_my - total_h / 2, self.T), self.B - total_h)
+        top = self._avoid_banned(top, total_h, banned)
+
+        y = top
+        boxes = []
+        for k in members:
+            h = self.items[k]["h"]
+            x1 = cx2 - self.items[k]["w"] if side == "r" else cx1
+            box = (x1, y, x1 + self.items[k]["w"], y + h)
+            boxes.append(box)
+            self.items[k]["box"] = box
+            self.items[k]["col"] = side
+            y += h + self.GAP
+        self.placed.extend(boxes)
+
+    def _avoid_banned(self, top, total_h, banned):
+        """整列在 [T,B] 内上下平移，避开 banned 纵向禁段；无处可让则维持（可压边界）。"""
+        for _ in range(12):
+            s, e = top, top + total_h
+            hit = next((b for b in banned if s < b[1] - self.GAP and b[0] + self.GAP < e), None)
+            if hit is None:
+                return top
+            up = hit[0] - total_h - self.GAP    # 整体提到禁段之上时的 top
+            down = hit[1] + self.GAP            # 整体压到禁段之下时的 top
+            cand = []
+            if up >= self.T:
+                cand.append((abs(up - top), up))
+            if down + total_h <= self.B:
+                cand.append((abs(down - top), down))
+            if not cand:
+                return min(max(top, self.T), self.B - total_h)
+            top = min(cand)[1]
+        return top
+
+    def _place_near(self, k):
+        """单点标签：贴在锚点上方（放不下改下方），纵向避让所有障碍。"""
+        it = self.items[k]
+        w, h, mx, my = it["w"], it["h"], it["mx"], it["my"]
+        cx = min(max(mx, self.L + w / 2), self.R - w / 2)
+        x1, x2 = cx - w / 2, cx + w / 2
+        dots = [o["dot"] for j, o in enumerate(self.items)
+                if j != k and "box" not in o]
+        blockers = self.placed + dots
+
+        def resolve(y_start, downward):
+            top = y_start
+            for _ in range(len(blockers) + 3):
+                box = (x1, top, x2, top + h)
+                hit = next((b for b in blockers if self._overlap(box, b)), None)
+                if hit is None:
+                    return box
+                top = hit[3] + self.GAP if downward else hit[1] - h - self.GAP
+            return (x1, top, x2, top + h)
+
+        box = resolve(my - self.EDGE_GAP - h, False)
+        if box[1] < self.T:
+            box = resolve(my + self.EDGE_GAP, True)
+            if box[3] > self.B:
+                box = (x1, self.B - h, x2, self.B)
+        it["box"] = box
+        self.placed.append(box)
+
+    def _draw_leaders(self):
+        """引线规则：
+        - 拥挤列：列外侧一条竖直“总线”，每个标签用短横挂到总线上（金融图标注惯例），
+          绝不穿过同列胶囊；锚点被列胶囊遮住时不回连，其余从列外一侧水平挂到总线；
+        - 单点标签：锚点在标签水平跨度内走竖直短线，在外侧走直角两段。
+        预留区（成本胶囊/价签）均在列的另一侧，总线与回连线不会穿过它们。"""
+        color = {"buy": "#ffb36b", "gold": "#d8bd7e"}
+        col_items, singles = [], []
+        for it in self.items:
+            (col_items if it.get("col") else singles).append(it)
+        if col_items:
+            self._draw_column_leaders(col_items, color)
+        for it in singles:
+            self._draw_single_leader(it, color.get(it["kind"], "#ffb36b"))
+
+    @staticmethod
+    def _inside(mx, my, box, pad=0):
+        x1, y1, x2, y2 = box
+        return x1 - pad <= mx <= x2 + pad and y1 - pad <= my <= y2 + pad
+
+    def _draw_column_leaders(self, items, color):
+        """同一列共用一条外侧竖直总线；标签短横挂签，锚点仅在列外时水平回连。"""
+        for side in ("r", "l"):
+            grp = [it for it in items if it.get("col") == side]
+            if not grp:
+                continue
+            # 列盒几何（同列所有胶囊 x 跨度一致）
+            if side == "r":
+                cx1 = min(it["box"][0] for it in grp)
+                bus_x = cx1 - 7  # 列左缘（数据区一侧）留 7px 空槽走总线
+            else:
+                cx2 = max(it["box"][2] for it in grp)
+                bus_x = cx2 + 7
+            ys = sorted((b[1] + b[3]) / 2 for b in (it["box"] for it in grp))
+            # 竖直总线：贯通最上与最下标签中心
+            self.cv.create_line(bus_x, ys[0], bus_x, ys[-1],
+                                fill=color["buy"], width=1)
+            col_x1 = min(i["box"][0] for i in grp)
+            col_x2 = max(i["box"][2] for i in grp)
+            col_y1 = min(i["box"][1] for i in grp)
+            col_y2 = max(i["box"][3] for i in grp)
+            for it in grp:
+                x1, y1, x2, y2 = it["box"]
+                cy = (y1 + y2) / 2
+                lc = color.get(it["kind"], "#ffb36b")
+                # 标签短横：总线 → 列缘（标签中心高度）
+                self.cv.create_line(bus_x, cy, x1 if side == "r" else x2, cy,
+                                    fill=lc, width=1)
+                mx, my = it["mx"], it["my"]
+                in_x = col_x1 - self.GAP <= mx <= col_x2 + self.GAP
+                if in_x and col_y1 - self.GAP <= my <= col_y2 + self.GAP:
+                    continue  # 锚点被列胶囊遮住（含同日抖动偏移），无需回连
+                if in_x:
+                    # 锚点在整列上方/下方露出：先竖直、再水平入总线（穿胶囊段被胶囊遮住）
+                    yc = min(max(my, ys[0]), ys[-1])
+                    self.cv.create_line(mx, my, mx, yc, bus_x, yc,
+                                        fill=lc, width=1)
+                elif side == "r" and mx > bus_x or side == "l" and mx < bus_x:
+                    # 锚点在总线外侧（右轴/左轴一侧）：水平挂到总线
+                    self.cv.create_line(mx, my, bus_x, my, fill=lc, width=1)
+
+    def _draw_single_leader(self, it, line_color):
+        x1, y1, x2, y2 = it["box"]
+        mx, my = it["mx"], it["my"]
+        if self._inside(mx, my, it["box"]):
+            return  # 点落在胶囊内，由胶囊遮住
+        if x1 - self.GAP <= mx <= x2 + self.GAP:
+            # 点在标签水平跨度内：竖直短线连最近边
+            edge_y = y2 if my >= y2 else y1
+            if abs(edge_y - my) > 2:
+                self.cv.create_line(mx, edge_y, mx, my, fill=line_color, width=1)
+            return
+        # 点在标签外侧：直角两段，连到标签朝向点一侧的近角
+        yy = y1 if my < (y1 + y2) / 2 else y2
+        ex = x1 if mx < x1 else x2
+        self.cv.create_line(mx, my, mx, yy, ex, yy, fill=line_color, width=1)
+
+
+def _round_rect(cv, x1, y1, x2, y2, r, **kw):
+    """Canvas 上的小圆角矩形（多边形近似）。"""
+    r = min(r, (x2 - x1) / 2, (y2 - y1) / 2)
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
+# ---------- 主应用 ----------
+
+class GoldMonitorApp:
+    def __init__(self):
+        self.cfg = load_config()
+        self.root = tk.Tk()
+        self.root.title(APP_NAME)
+        self.root.geometry("420x590")
+        self.root.minsize(420, 560)
+        self.root.configure(bg="#f5f5f7")
+
+        self.toasts = ToastManager(self.root)
+        self.stop_event = threading.Event()
+        self.last_price = self.cfg.get("last_price")  # 启动后首次成功取价会重置基线
+        self.baseline_set = False
+        self.failed_count = 0
+        self._latest_sell = None
+        self._latest_high = 0.0
+        self._latest_low = 0.0
+        self._latest_data = {}
+        self._trade_date = self.cfg.get("today_base_date")
+        self._trades_win = None  # 交易记录窗口（打开期间随行情刷新）
+        self._chart_win = None   # 分时走势图窗口（打开期间随行情刷新）
+        self._hist = load_history()  # 本地分时行情 {交易日: [["HH:MM", 价格], ...]}
+        self._hist_dirty = False
+        self._last_hist_save = 0.0
+        # 在线趋势（东方财富黄金9999）缓存：key -> (数据, 取数时间戳)
+        self._em_cache = {}
+        self._em_loading = set()  # 正在后台拉取的 key，避免重复请求
+        self._chart_seq = 0  # 走势图绘制代际令牌，丢弃切模式前在途的在线回调
+
+        self._build_ui()
+        self._build_tray()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
+        self.root.after(300, self._poll_once)
+
+    # ---- UI ----
+    def _build_ui(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("vista")
+        except tk.TclError:
+            pass
+
+        header = tk.Frame(self.root, bg="#c7000b", height=64)
+        header.pack(fill="x")
+        tk.Label(header, text="工银积存金 · 实时监控", bg="#c7000b", fg="#fff",
+                font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w", padx=16, pady=(12, 0))
+        self.time_var = tk.StringVar(value="等待行情…")
+        tk.Label(header, textvariable=self.time_var, bg="#c7000b", fg="#ffd9dc",
+                font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=16, pady=(0, 10))
+
+        card = tk.Frame(self.root, bg="#ffffff", highlightbackground="#e5e5ea",
+                        highlightthickness=1)
+        card.pack(fill="x", padx=16, pady=14)
+
+        self.name_var = tk.StringVar(value=SOURCES[self.cfg["source"]]["name"])
+        tk.Label(card, textvariable=self.name_var, bg="#fff", fg="#888",
+                font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=16, pady=(12, 0))
+
+        self.price_var = tk.StringVar(value="--")
+        self.price_label = tk.Label(card, textvariable=self.price_var, bg="#fff", fg="#222",
+                                    font=("Microsoft YaHei UI", 28, "bold"))
+        self.price_label.pack(anchor="w", padx=14)
+
+        meta = tk.Frame(card, bg="#fff")
+        meta.pack(fill="x", padx=16, pady=(0, 12))
+        self.hl_var = tk.StringVar(value="最高 --")
+        self.ll_var = tk.StringVar(value="最低 --")
+        self.chg_var = tk.StringVar(value="")
+        tk.Label(meta, textvariable=self.hl_var, bg="#fff", fg="#888",
+                font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Label(meta, textvariable=self.ll_var, bg="#fff", fg="#888",
+                font=("Microsoft YaHei UI", 9)).pack(side="left", padx=14)
+        tk.Label(meta, textvariable=self.chg_var, bg="#fff", fg="#888",
+                font=("Microsoft YaHei UI", 9)).pack(side="right")
+
+        # 我的持仓（按积存金赎回价估值）
+        pos = tk.Frame(self.root, bg="#fffdf7", highlightbackground="#e8d9b0",
+                       highlightthickness=1)
+        pos.pack(fill="x", padx=16, pady=(0, 12))
+
+        pos_head = tk.Frame(pos, bg="#fffdf7")
+        pos_head.pack(fill="x", padx=14, pady=(10, 2))
+        tk.Label(pos_head, text="我的持仓 · 工银积存金（按赎回价估值）",
+                 bg="#fffdf7", fg="#8a6d2b",
+                 font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
+        self.privacy_btn = tk.Button(
+            pos_head, text=("👁 隐藏" if not self.cfg.get("privacy") else "🙈 显示"),
+            font=("Microsoft YaHei UI", 8), fg="#8a6d2b", bg="#fffdf7", bd=0,
+            cursor="hand2", activebackground="#f6edd4",
+            command=self._toggle_privacy)
+        self.privacy_btn.pack(side="right")
+        tk.Button(pos_head, text="编辑", font=("Microsoft YaHei UI", 8),
+                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
+                  activebackground="#f6edd4", command=self._edit_position).pack(
+            side="right", padx=(0, 10))
+        tk.Button(pos_head, text="补仓测算", font=("Microsoft YaHei UI", 8),
+                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
+                  activebackground="#f6edd4",
+                  command=self._avg_down_calculator).pack(side="right", padx=(0, 10))
+        tk.Button(pos_head, text="卖出测算", font=("Microsoft YaHei UI", 8),
+                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
+                  activebackground="#f6edd4",
+                  command=self._sell_calculator).pack(side="right", padx=(0, 10))
+        tk.Button(pos_head, text="交易记录", font=("Microsoft YaHei UI", 8),
+                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
+                  activebackground="#f6edd4",
+                  command=self._open_trades).pack(side="right", padx=(0, 10))
+        tk.Button(pos_head, text="走势图", font=("Microsoft YaHei UI", 8),
+                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
+                  activebackground="#f6edd4",
+                  command=self._open_chart).pack(side="right", padx=(0, 10))
+
+        self.pos_mv_var = tk.StringVar(value="实时市值 --")
+        self.pos_pl_var = tk.StringVar(value="持有收益 --")
+        self.pos_pl_pct_var = tk.StringVar(value="")
+        self.pos_today_var = tk.StringVar(value="今日盈亏 --")
+        self.pos_info_var = tk.StringVar(value="")
+
+        self.pos_mv_label = tk.Label(pos, textvariable=self.pos_mv_var, bg="#fffdf7",
+                                     fg="#222", font=("Microsoft YaHei UI", 17, "bold"))
+        self.pos_mv_label.pack(anchor="w", padx=14)
+        self.pos_pl_label = tk.Label(pos, textvariable=self.pos_pl_var, bg="#fffdf7",
+                                     fg="#888", font=("Microsoft YaHei UI", 10))
+        self.pos_pl_label.pack(anchor="w", padx=14)
+
+        row = tk.Frame(pos, bg="#fffdf7")
+        row.pack(fill="x", padx=14, pady=(6, 2))
+        self.pos_today_label = tk.Label(row, textvariable=self.pos_today_var,
+                                        bg="#fffdf7", fg="#888",
+                                        font=("Microsoft YaHei UI", 10, "bold"))
+        self.pos_today_label.pack(side="left")
+        tk.Label(row, textvariable=self.pos_pl_pct_var, bg="#fffdf7", fg="#888",
+                 font=("Microsoft YaHei UI", 9)).pack(side="right")
+
+        tk.Label(pos, textvariable=self.pos_info_var, bg="#fffdf7", fg="#999",
+                 font=("Microsoft YaHei UI", 8), wraplength=370, justify="left").pack(
+            anchor="w", padx=14, pady=(0, 10))
+
+        # 设置区
+        box = tk.LabelFrame(self.root, text=" 监控设置 ", bg="#f5f5f7", fg="#333",
+                            font=("Microsoft YaHei UI", 9, "bold"))
+        box.pack(fill="x", padx=16)
+
+        tk.Label(box, text="监控品种", bg="#f5f5f7",
+                font=("Microsoft YaHei UI", 9)).grid(row=0, column=0, sticky="w", padx=8, pady=8)
+        self.source_var = tk.StringVar(value=self.cfg["source"])
+        names = {k: v["name"] for k, v in SOURCES.items()}
+        self.source_combo = ttk.Combobox(box, textvariable=self.source_var,
+                                         values=list(names.values()), state="readonly", width=24)
+        self.name_to_key = {v: k for k, v in names.items()}
+        self.source_combo.set(names[self.cfg["source"]])
+        self.source_combo.grid(row=0, column=1, columnspan=2, sticky="w", padx=4)
+        self.source_combo.bind("<<ComboboxSelected>>", self._on_source_change)
+
+        tk.Label(box, text="档位间隔(元)", bg="#f5f5f7",
+                font=("Microsoft YaHei UI", 9)).grid(row=1, column=0, sticky="w", padx=8, pady=8)
+        self.step_var = tk.StringVar(value=str(self.cfg["step"]))
+        ttk.Combobox(box, textvariable=self.step_var, width=8, state="readonly",
+                     values=["1", "2", "5", "10", "20", "50"]).grid(row=1, column=1, sticky="w")
+
+        tk.Label(box, text="刷新间隔(秒)", bg="#f5f5f7",
+                font=("Microsoft YaHei UI", 9)).grid(row=2, column=0, sticky="w", padx=8, pady=8)
+        self.interval_var = tk.StringVar(value=str(self.cfg["interval"]))
+        ttk.Spinbox(box, from_=5, to=300, increment=5, width=10,
+                    textvariable=self.interval_var).grid(row=2, column=1, sticky="w")
+
+        self.sound_var = tk.BooleanVar(value=self.cfg["sound"])
+        ttk.Checkbutton(box, text="弹窗时播放提示音", variable=self.sound_var).grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 8))
+
+        self.autostart_var = tk.BooleanVar(value=self.cfg["autostart"])
+        ttk.Checkbutton(box, text="开机自动启动", variable=self.autostart_var,
+                        command=self._on_autostart).grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 8))
+
+        # 按钮
+        btns = tk.Frame(self.root, bg="#f5f5f7")
+        btns.pack(fill="x", padx=16, pady=12)
+        ttk.Button(btns, text="立即刷新", command=self._poll_once).pack(side="left")
+        ttk.Button(btns, text="测试弹窗", command=self._test_alert).pack(side="left", padx=8)
+        ttk.Button(btns, text="最小化到托盘", command=self.hide_window).pack(side="right")
+
+        self.status_var = tk.StringVar(value="")
+        tk.Label(self.root, textvariable=self.status_var, bg="#f5f5f7", fg="#999",
+                font=("Microsoft YaHei UI", 8), wraplength=380, justify="left").pack(
+            anchor="w", padx=18)
+
+    def _on_source_change(self, _=None):
+        key = self.name_to_key.get(self.source_combo.get())
+        if key:
+            self.cfg["source"] = key
+            self.name_var.set(SOURCES[key]["name"])
+            self.baseline_set = False  # 切换品种后重新建立基线，避免误报
+            self._persist()
+            self._poll_once()
+
+    def _on_autostart(self):
+        ok = set_autostart(self.autostart_var.get())
+        self.cfg["autostart"] = bool(ok) and self.autostart_var.get()
+        if not ok and self.autostart_var.get():
+            self.autostart_var.set(False)
+            messagebox.showwarning(APP_NAME, "设置开机自启失败（可能需要管理员权限）。")
+        self._persist()
+
+    # ---- 我的持仓 ----
+    def _toggle_privacy(self):
+        self.cfg["privacy"] = not bool(self.cfg.get("privacy"))
+        self.privacy_btn.configure(
+            text=("👁 隐藏" if not self.cfg["privacy"] else "🙈 显示"))
+        self._persist()
+        self._render_position()
+        if self._trades_win is not None:
+            self._refresh_trades()
+        if self._chart_win is not None:
+            self._draw_chart()
+
+    def _roll_today_base(self, date_str):
+        """跨交易日滚动今日盈亏基准价：新交易日基准 = 上一交易日最后记录的赎回价。"""
+        sell = self._latest_sell
+        if not sell or not date_str:
+            return
+        self._trade_date = date_str
+        new_day = self.cfg.get("today_base_date") != date_str
+        if new_day:
+            # 进入新交易日：今日基准 = 上一交易日记录的最后赎回价（首次运行时为空）
+            self.cfg["today_base"] = (
+                self.cfg.get("last_close")
+                if self.cfg.get("last_close_date") and self.cfg["last_close_date"] != date_str
+                else None)
+            self.cfg["today_base_date"] = date_str
+        # 持续记录当天最后赎回价（程序运行至收盘附近即近似收盘价）
+        self.cfg["last_close"] = sell
+        self.cfg["last_close_date"] = date_str
+        self._persist()
+
+    def _edit_position(self):
+        win = tk.Toplevel(self.root)
+        win.title("编辑我的持仓")
+        win.geometry("320x250")
+        win.resizable(False, False)
+        win.configure(bg="#f5f5f7")
+        win.transient(self.root)
+        win.grab_set()
+
+        grams_var = tk.StringVar(value=f"{self.cfg.get('hold_grams') or 0:g}")
+        cost_var = tk.StringVar(value=f"{self.cfg.get('hold_cost') or 0:g}")
+        base_var = tk.StringVar(
+            value="" if self.cfg.get("today_base") is None
+            else f"{self.cfg['today_base']:g}")
+
+        def add_row(r, label, var, hint=""):
+            tk.Label(win, text=label, bg="#f5f5f7",
+                     font=("Microsoft YaHei UI", 9)).grid(row=r, column=0, sticky="w",
+                                                          padx=14, pady=(10, 0))
+            ttk.Entry(win, textvariable=var, width=16).grid(row=r, column=1,
+                                                            padx=8, pady=(10, 0))
+            if hint:
+                tk.Label(win, text=hint, bg="#f5f5f7", fg="#999",
+                         font=("Microsoft YaHei UI", 8)).grid(
+                    row=r + 1, column=1, sticky="w", padx=8)
+
+        add_row(0, "持有克数(克)", grams_var)
+        add_row(2, "累计投入成本(元)", cost_var)
+        add_row(4, "今日基准价(元/克)", base_var, "留空则自动用上一交易日最后价")
+
+        def on_save():
+            try:
+                self.cfg["hold_grams"] = max(0.0, float(grams_var.get()))
+                self.cfg["hold_cost"] = max(0.0, float(cost_var.get()))
+                base = base_var.get().strip()
+                if base:
+                    self.cfg["today_base"] = float(base)
+                    self.cfg["today_base_date"] = self._trade_date
+                else:
+                    self.cfg["today_base"] = None
+                self._persist()
+                win.destroy()
+                self._render_position()
+            except ValueError:
+                messagebox.showwarning("编辑持仓", "请填写有效的数字。", parent=win)
+
+        btns = tk.Frame(win, bg="#f5f5f7")
+        btns.grid(row=6, column=0, columnspan=2, pady=16)
+        ttk.Button(btns, text="保存", command=on_save).pack(side="left", padx=8)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left")
+
+    # ---- 补仓测算 ----
+    def _avg_down_calculator(self):
+        win = tk.Toplevel(self.root)
+        win.title("补仓回本测算")
+        win.geometry("430x486")
+        win.resizable(False, False)
+        win.configure(bg="#f5f5f7")
+        win.transient(self.root)
+        win.grab_set()
+
+        grams0 = float(self.cfg.get("hold_grams") or 0)
+        cost0 = float(self.cfg.get("hold_cost") or 0)
+        buy_px = self._latest_data.get("jicun_active")
+        sell_px = self._latest_data.get("jicun_sell")
+
+        tk.Label(win, text="假设按当前实时价格立即补仓", bg="#f5f5f7", fg="#333",
+                 font=("Microsoft YaHei UI", 11, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(14, 4))
+
+        in_box = tk.Frame(win, bg="#f5f5f7")
+        in_box.grid(row=1, column=0, columnspan=2, sticky="we", padx=18)
+        tk.Label(in_box, text="补仓金额(元)", bg="#f5f5f7",
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        amt_var = tk.StringVar(value="5000")
+        ttk.Entry(in_box, textvariable=amt_var, width=12).pack(side="left", padx=8)
+        tk.Label(in_box, text="买入价(元/克)", bg="#f5f5f7",
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(10, 0))
+        px_var = tk.StringVar(value=f"{buy_px:g}" if buy_px else "")
+        ttk.Entry(in_box, textvariable=px_var, width=9).pack(side="left", padx=8)
+
+        result = tk.Frame(win, bg="#ffffff", highlightbackground="#e5e5ea",
+                          highlightthickness=1)
+        result.grid(row=2, column=0, columnspan=2, sticky="we", padx=18, pady=12)
+        result.columnconfigure(0, weight=1)
+        rvar = tk.StringVar(value="")
+        tk.Label(result, textvariable=rvar, bg="#fff", fg="#222", justify="left",
+                 font=("Microsoft YaHei UI", 10), wraplength=380, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=14, pady=12)
+
+        tk.Label(win, text="※ 回本=赎回价回到摊薄均价；金价未来走势无法预测，\n"
+                           "   下方月数为“假设匀速月涨幅”下的理论参考，不构成投资建议。",
+                 bg="#f5f5f7", fg="#999", justify="left",
+                 font=("Microsoft YaHei UI", 8)).grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 6))
+
+        ttk.Button(win, text="开始测算",
+                   command=lambda: calc()).grid(row=4, column=0, pady=8)
+        ttk.Button(win, text="关闭", command=win.destroy).grid(row=4, column=1)
+
+        def calc():
+            try:
+                add_money = float(amt_var.get())
+                buy = float(px_var.get())
+            except ValueError:
+                rvar.set("请填写有效的补仓金额和买入价。")
+                return
+            if add_money <= 0 or buy <= 0 or grams0 <= 0:
+                rvar.set("请先在“编辑”中填写已有克数，并填入有效的补仓金额/买入价。")
+                return
+
+            add_grams = add_money / buy
+            new_grams = grams0 + add_grams
+            new_cost = cost0 + add_money
+            avg = new_cost / new_grams
+            avg_old = cost0 / grams0
+            spread = (buy - sell_px) if sell_px else 0.0  # 买卖价差（点差）
+
+            # 回本目标：赎回价需达到摊薄均价。当前价按买入价。
+            cur_sell = sell_px if sell_px else buy
+            need_gap = avg - cur_sell
+            need_pct = need_gap / cur_sell * 100
+            # 浮亏（按当前赎回价估值）
+            pl_now = grams0 * cur_sell - cost0
+
+            def months(month_rate):
+                if need_gap <= 0:
+                    return 0.0
+                return math.log(avg / cur_sell) / math.log(1 + month_rate)
+
+            if need_gap <= 0:
+                horizon = "按当前赎回价，补仓后已处于回本价位。"
+            else:
+                parts = []
+                for mr in (0.01, 0.02, 0.03, 0.05):
+                    m = months(mr)
+                    parts.append(f"月涨{mr * 100:g}%：约 {m:.1f} 个月（{m / 12:.1f} 年）")
+                horizon = "回本所需时间（理论参考）\n" + "\n".join(parts)
+
+            rvar.set(
+                f"本次补仓 {add_money:,.0f} 元 ≈ {add_grams:.4f} 克（买入价 {buy:.2f}）\n"
+                f"补仓后总持仓 {new_grams:.4f} 克，总成本 {new_cost:,.2f} 元\n"
+                f"摊薄均价 {avg_old:.2f} → {avg:.2f} 元/克（降低 {avg_old - avg:.2f}）\n"
+                f"当前赎回价 {cur_sell:.2f}（买卖价差 {spread:.2f}）\n"
+                f"需赎回价再涨 {need_gap:.2f} 元（+{need_pct:.2f}%）才回本\n"
+                f"补仓前浮盈 {pl_now:,.2f} 元\n"
+                f"———————————\n{horizon}")
+
+        if buy_px:
+            calc()  # 打开时先用实时价算一次
+
+    # ---- 卖出（赎回）手续费测算 ----
+    def _sell_calculator(self):
+        win = tk.Toplevel(self.root)
+        win.title("卖出测算 · 赎回手续费")
+        win.geometry("430x470")
+        win.resizable(False, False)
+        win.configure(bg="#f5f5f7")
+        win.transient(self.root)
+        win.grab_set()
+
+        grams0 = float(self.cfg.get("hold_grams") or 0)
+        cost0 = float(self.cfg.get("hold_cost") or 0)
+        sell_px = self._latest_data.get("jicun_sell")
+        hidden = bool(self.cfg.get("privacy"))
+
+        tk.Label(win, text="假设按当前实时赎回价立即卖出", bg="#f5f5f7", fg="#333",
+                 font=("Microsoft YaHei UI", 11, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(14, 4))
+
+        in_box = tk.Frame(win, bg="#f5f5f7")
+        in_box.grid(row=1, column=0, columnspan=2, sticky="we", padx=18)
+        tk.Label(in_box, text="卖出克数(克)", bg="#f5f5f7",
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        g_var = tk.StringVar(value=(f"{grams0:g}" if grams0 else ""))
+        ttk.Entry(in_box, textvariable=g_var, width=11).pack(side="left", padx=8)
+        tk.Label(in_box, text="赎回价(元/克)", bg="#f5f5f7",
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(10, 0))
+        px_var = tk.StringVar(value=f"{sell_px:g}" if sell_px else "")
+        ttk.Entry(in_box, textvariable=px_var, width=9).pack(side="left", padx=8)
+
+        result = tk.Frame(win, bg="#ffffff", highlightbackground="#e5e5ea",
+                          highlightthickness=1)
+        result.grid(row=2, column=0, columnspan=2, sticky="we", padx=18, pady=12)
+        result.columnconfigure(0, weight=1)
+        rvar = tk.StringVar(value="")
+        tk.Label(result, textvariable=rvar, bg="#fff", fg="#222", justify="left",
+                 font=("Microsoft YaHei UI", 10), wraplength=380, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=14, pady=12)
+
+        tk.Label(win, text="※ 赎回手续费=赎回金额×0.5%（工行个人积存金标准），\n"
+                           "   按赎回当日实时赎回价成交，资金一般 T+5 个工作日到账；\n"
+                           "   兑换实物金条不按此收费。实际以工行办理时为准。",
+                 bg="#f5f5f7", fg="#999", justify="left",
+                 font=("Microsoft YaHei UI", 8)).grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 6))
+
+        ttk.Button(win, text="开始测算",
+                   command=lambda: calc()).grid(row=4, column=0, pady=8)
+        ttk.Button(win, text="关闭", command=win.destroy).grid(row=4, column=1)
+
+        def calc():
+            try:
+                g = float(g_var.get())
+                p = float(px_var.get())
+            except ValueError:
+                rvar.set("请填写有效的卖出克数和赎回价。")
+                return
+            if g <= 0 or p <= 0:
+                rvar.set("请填写有效的卖出克数和赎回价。")
+                return
+            if grams0 <= 0:
+                rvar.set("请先在“编辑”中填写持仓克数。")
+                return
+            if g > grams0 + 1e-9:
+                rvar.set(f"卖出克数不能超过当前持仓（{grams0:.4f} 克）。")
+                return
+
+            redeem = g * p                       # 赎回金额（扣费前）
+            fee = redeem * REDEEM_FEE_RATE       # 赎回手续费 0.5%
+            arrived = redeem - fee               # 实际到账
+            cost_part = cost0 * g / grams0       # 按比例分摊的对应成本
+            pl = arrived - cost_part             # 净盈亏（扣费后）
+            fee_eff = fee / g                    # 折算每克手续费
+
+            def mg(s):
+                return "****" if hidden else s
+
+            lines = [
+                f"卖出 {mg(f'{g:.4f}')} 克 × 赎回价 {p:.2f}",
+                f"赎回金额（扣费前）：{mg(f'{redeem:,.2f}')} 元",
+                f"手续费（0.5%）：{mg(f'{fee:,.2f}')} 元（约 {mg(f'{fee_eff:.2f}')} 元/克）",
+                f"实际到账：{mg(f'{arrived:,.2f}')} 元",
+                f"对应成本：{mg(f'{cost_part:,.2f}')} 元",
+                f"扣费后净盈亏：{mg(f'{pl:,.2f}')} 元",
+            ]
+            if g < grams0 - 1e-9:
+                rest_g = grams0 - g
+                rest_cost = cost0 - cost_part
+                lines.append("———————————")
+                lines.append(f"本次为部分卖出，剩余 {mg(f'{rest_g:.4f}')} 克，"
+                             f"剩余成本 {mg(f'{rest_cost:,.2f}')} 元")
+            rvar.set("\n".join(lines))
+
+        if sell_px:
+            calc()  # 打开时先用实时赎回价算一次
+
+    # ---- 交易记录（逐笔盈亏）----
+    def _open_trades(self):
+        if self._trades_win is not None and tk.Toplevel.winfo_exists(self._trades_win):
+            self._trades_win.lift()
+            self._trades_win.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("补仓记录 · 逐笔盈亏")
+        win.geometry("600x540")
+        win.minsize(560, 460)
+        win.configure(bg="#f5f5f7")
+        win.transient(self.root)
+
+        tk.Label(win, text="补仓记录 · 按实时赎回价计算浮动盈亏", bg="#f5f5f7", fg="#333",
+                font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=16, pady=(12, 2))
+        self._trades_tip_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=self._trades_tip_var, bg="#f5f5f7", fg="#999",
+                font=("Microsoft YaHei UI", 8), justify="left").pack(anchor="w", padx=16)
+
+        cols = ("dt", "amount", "grams", "price", "pl", "pct")
+        headers = ("买入时间", "金额(元)", "克数(克)", "买入价", "浮动盈亏(元)", "涨跌幅")
+        widths = (130, 80, 85, 75, 105, 75)
+        frame = tk.Frame(win, bg="#fff", highlightbackground="#e5e5ea", highlightthickness=1)
+        frame.pack(fill="both", expand=True, padx=16, pady=10)
+        tree = ttk.Treeview(frame, columns=cols, show="headings", height=11, selectmode="browse")
+        for c, h, w in zip(cols, headers, widths):
+            tree.heading(c, text=h)
+            tree.column(c, width=w, anchor="w" if c == "dt" else "e")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        tree.tag_configure("plus", foreground="#d93025")
+        tree.tag_configure("minus", foreground="#00a650")
+        tree.tag_configure("base", background="#f6f1e3")
+        tree.tag_configure("total", background="#eef3ff")
+        self._trades_tree = tree
+
+        btns = tk.Frame(win, bg="#f5f5f7")
+        btns.pack(fill="x", padx=16, pady=(0, 12))
+        ttk.Button(btns, text="添加补仓", command=self._add_trade).pack(side="left")
+        ttk.Button(btns, text="删除选中", command=self._delete_trade).pack(side="left", padx=8)
+        ttk.Button(btns, text="关闭", command=self._close_trades).pack(side="right")
+
+        self._trades_win = win
+        win.protocol("WM_DELETE_WINDOW", self._close_trades)
+        self._refresh_trades()
+
+    def _refresh_trades(self):
+        win = self._trades_win
+        if win is None or not tk.Toplevel.winfo_exists(win):
+            return
+        tree = self._trades_tree
+        tree.delete(*tree.get_children())
+        sell = self._latest_sell
+        trades = self.cfg.get("trades") or []
+
+        hidden = bool(self.cfg.get("privacy"))
+        detail_g = detail_a = detail_pl = 0.0
+        for i, t in enumerate(trades):
+            amt = float(t.get("amount") or 0)
+            g = float(t.get("grams") or 0)
+            px = amt / g if g else 0.0
+            detail_g += g
+            detail_a += amt
+            if hidden:
+                vals = (t.get("dt", ""), "****", "****", "****", "****", "****")
+                tag = ()
+            elif sell:
+                pl = (sell - px) * g
+                detail_pl += pl
+                vals = (t.get("dt", ""), f"{amt:,.0f}", f"{g:.4f}", f"{px:.2f}",
+                        f"{pl:+,.2f}", f"{(sell / px - 1) * 100:+.2f}%")
+                tag = ("plus",) if pl >= 0 else ("minus",)
+            else:
+                vals = (t.get("dt", ""), f"{amt:,.0f}", f"{g:.4f}", f"{px:.2f}", "--", "--")
+                tag = ()
+            tree.insert("", "end", iid=f"t{i}", values=vals, tags=tag)
+
+        # 底仓：总持仓减去补仓明细，倒挤出更早的买入
+        grams0 = float(self.cfg.get("hold_grams") or 0)
+        cost0 = float(self.cfg.get("hold_cost") or 0)
+        base_g, base_a = grams0 - detail_g, cost0 - detail_a
+        total_g, total_a, total_pl = detail_g, detail_a, detail_pl
+        if abs(base_g) > 0.0001 or abs(base_a) > 0.01:
+            if base_g < -0.0001 or base_a < -0.01:
+                tree.insert("", "end", iid="base",
+                            values=("底仓（异常：明细超出总持仓）",
+                                    "****" if hidden else f"{base_a:,.0f}",
+                                    "****" if hidden else f"{base_g:.4f}",
+                                    "--", "请核对持仓" if not hidden else "****", ""),
+                            tags=("minus", "base"))
+            else:
+                bpx = base_a / base_g if base_g > 0.0001 else 0.0
+                if hidden:
+                    vals = ("底仓（更早买入 · 倒挤）", "****", "****", "****", "****", "****")
+                    tags = ("base",)
+                elif sell:
+                    bpl = (sell - bpx) * base_g
+                    total_pl += bpl
+                    vals = ("底仓（更早买入 · 倒挤）", f"{base_a:,.0f}", f"{base_g:.4f}",
+                            f"{bpx:.2f}", f"{bpl:+,.2f}", f"{(sell / bpx - 1) * 100:+.2f}%")
+                    tags = ("plus", "base") if bpl >= 0 else ("minus", "base")
+                else:
+                    vals = ("底仓（更早买入 · 倒挤）", f"{base_a:,.0f}", f"{base_g:.4f}",
+                            f"{bpx:.2f}", "--", "--")
+                    tags = ("base",)
+                tree.insert("", "end", iid="base", values=vals, tags=tags)
+                total_g += base_g
+                total_a += base_a
+
+        # 合计
+        if hidden:
+            vals = ("合计", "****", "****", "****", "****", "****")
+            tags = ("total",)
+        elif sell:
+            vals = ("合计", f"{total_a:,.0f}", f"{total_g:.4f}",
+                    f"{total_a / total_g:.2f}" if total_g else "--",
+                    f"{total_pl:+,.2f}", f"{total_pl / total_a * 100:+.2f}%")
+            tags = ("plus", "total") if total_pl >= 0 else ("minus", "total")
+        else:
+            vals = ("合计", f"{total_a:,.0f}", f"{total_g:.4f}",
+                    f"{total_a / total_g:.2f}" if total_g else "--", "--", "")
+            tags = ("total",)
+        tree.insert("", "end", iid="total", values=vals, tags=tags)
+
+        if sell:
+            self._trades_tip_var.set(
+                f"实时赎回价 {sell:.2f} 元/克｜红盈绿亏｜买入价按“金额÷克数”倒算，与App成交单价或有小幅差异")
+        else:
+            self._trades_tip_var.set(
+                "暂无实时赎回价（非交易时段），浮盈显示 --｜买入价按“金额÷克数”倒算")
+
+    def _close_trades(self):
+        win = self._trades_win
+        self._trades_win = None
+        self._trades_tree = None
+        self._trades_tip_var = None
+        if win is not None:
+            win.destroy()
+
+    # ---- 分时走势图（仿支付宝：金色分时线 + 高低点 + 买入点位） ----
+    def _open_chart(self):
+        if self._chart_win is not None and tk.Toplevel.winfo_exists(self._chart_win):
+            self._chart_win.lift()
+            self._chart_win.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("积存金走势 · 买入点位")
+        win.geometry("900x540")
+        win.minsize(780, 480)
+        win.configure(bg="#f5f5f7")
+        win.transient(self.root)
+
+        top = tk.Frame(win, bg="#f5f5f7")
+        top.pack(fill="x", padx=14, pady=(12, 4))
+        tk.Label(top, text="模式", bg="#f5f5f7",
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        self._chart_mode_var = tk.StringVar(value="今日分时（在线）")
+        self._chart_mode_combo = ttk.Combobox(
+            top, textvariable=self._chart_mode_var, width=16, state="readonly",
+            values=["今日分时（在线）", "历史日K（在线）", "本地采集分时"])
+        self._chart_mode_combo.pack(side="left", padx=(6, 14))
+        self._chart_mode_combo.bind("<<ComboboxSelected>>",
+                                    lambda _=None: self._on_chart_mode())
+        tk.Label(top, text="交易日", bg="#f5f5f7",
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        days = sorted(self._hist.keys(), reverse=True)
+        today = self._trade_date or (days[0] if days else "")
+        if today and today not in days:
+            days.insert(0, today)
+        self._chart_day_var = tk.StringVar(value=days[0] if days else "")
+        self._chart_combo = ttk.Combobox(
+            top, textvariable=self._chart_day_var, values=days,
+            state="disabled", width=12)
+        self._chart_combo.pack(side="left", padx=(6, 14))
+        self._chart_combo.bind("<<ComboboxSelected>>", lambda _=None: self._draw_chart())
+        self._chart_cost_var = tk.BooleanVar(value=True)
+        self._chart_cost_cb = ttk.Checkbutton(
+            top, text="显示持仓成本线", variable=self._chart_cost_var,
+            command=self._draw_chart)
+        self._chart_cost_cb.pack(side="left")
+        self._chart_refresh_btn = tk.Button(
+            top, text="刷新", font=("Microsoft YaHei UI", 8),
+            relief="groove", bg="#f5f5f7", padx=6, command=self._reload_chart)
+        self._chart_refresh_btn.pack(side="right")
+
+        chart_frame = tk.Frame(win, bg="#ffffff",
+                               highlightbackground="#e5e5ea", highlightthickness=1)
+        chart_frame.pack(fill="both", expand=True, padx=14, pady=(4, 6))
+        self._chart_canvas = tk.Canvas(chart_frame, bg="#ffffff",
+                                       highlightthickness=0, height=400)
+        self._chart_canvas.pack(fill="both", expand=True)
+        self._chart_canvas.bind("<Configure>", lambda _=None: self._draw_chart())
+
+        self._chart_tip_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=self._chart_tip_var, bg="#f5f5f7", fg="#999",
+                 font=("Microsoft YaHei UI", 8), justify="left",
+                 wraplength=760).pack(anchor="w", padx=16, pady=(0, 10))
+
+        self._chart_win = win
+        win.protocol("WM_DELETE_WINDOW", self._close_chart)
+        self._draw_chart()
+
+    def _close_chart(self):
+        win = self._chart_win
+        self._chart_win = None
+        self._chart_canvas = None
+        self._chart_combo = None
+        self._chart_day_var = None
+        self._chart_cost_var = None
+        self._chart_cost_cb = None
+        self._chart_mode_var = None
+        self._chart_mode_combo = None
+        self._chart_refresh_btn = None
+        self._chart_tip_var = None
+        if win is not None:
+            win.destroy()
+
+    @staticmethod
+    def _hm_to_min(hm):
+        h, m = hm.split(":")[:2]
+        return int(h) * 60 + int(m)
+
+    @staticmethod
+    def _dot(cv, x, y, r=4.5, color="#ff8a00"):
+        """买点 / 端点圆点：实心 + 白描边。"""
+        cv.create_oval(x - r, y - r, x + r, y + r,
+                       fill=color, outline="#ffffff", width=1.6)
+
+    # ---- 走势图（三模式：在线分时 / 在线历史日K / 本地采集分时） ----
+    CHART_MODES = {"今日分时（在线）": "today",
+                   "历史日K（在线）": "daily",
+                   "本地采集分时": "local"}
+
+    def _on_chart_mode(self):
+        mode = self.CHART_MODES.get(self._chart_mode_var.get(), "today")
+        # 交易日下拉仅在本地采集模式下使用
+        self._chart_combo.configure(state="readonly" if mode == "local" else "disabled")
+        self._draw_chart()
+
+    def _reload_chart(self):
+        self._em_cache.clear()  # 强制重新拉取在线行情
+        self._draw_chart()
+
+    def _draw_chart(self):
+        win = self._chart_win
+        if win is None or not tk.Toplevel.winfo_exists(win):
+            return
+        cv = self._chart_canvas
+        cv.delete("all")
+        cv.update_idletasks()
+        self._chart_seq += 1  # 代际令牌：使切模式前在途的在线回调失效
+        w = max(cv.winfo_width(), 700)
+        h = max(cv.winfo_height(), 360)
+        L, R, T, B = 18, w - 78, 46, h - 38
+        mode = self.CHART_MODES.get(self._chart_mode_var.get(), "today")
+        if mode == "today":
+            self._draw_em_trend(cv, L, R, T, B)
+        elif mode == "daily":
+            self._draw_em_daily(cv, L, R, T, B)
+        else:
+            self._draw_local(cv, L, R, T, B)
+
+    def _ensure_em(self, key, ttl, loader, on_done, on_wait):
+        """在线行情缓存 + 后台线程拉取。命中缓存直接 on_done；拉取中/失败调 on_wait。"""
+        seq = self._chart_seq  # 本次绘制的代际，回调时若已切模式则丢弃
+        cached = self._em_cache.get(key)
+        if cached and time.time() - cached[1] < ttl:
+            on_done(cached[0])
+            return
+        if key in self._em_loading:
+            on_wait(cached[0] if cached else None, None)
+            return
+        self._em_loading.add(key)
+
+        def work():
+            data, err = None, None
+            try:
+                data = loader()
+                self._em_cache[key] = (data, time.time())
+            except Exception as e:  # 网络/解析失败，界面提示可重试
+                err = str(e)
+
+            def ui():
+                self._em_loading.discard(key)
+                if self._chart_win is None or not tk.Toplevel.winfo_exists(self._chart_win):
+                    return
+                if self._chart_seq != seq:  # 期间已切换模式/重绘，本次结果作废
+                    return
+                # 清掉同步阶段画的“正在加载…”，避免失败/成功文案与之叠印
+                # （各 on_done/on_wait 均自绘网格整框，可安全全清）
+                if self._chart_canvas is not None:
+                    self._chart_canvas.delete("all")
+                if err is not None:
+                    on_wait(cached[0] if cached else None, err)
+                else:
+                    on_done(data)
+            self.root.after(0, ui)
+
+        threading.Thread(target=work, daemon=True).start()
+        on_wait(cached[0] if cached else None, None)
+
+    def _chart_message(self, cv, L, R, T, B, text, tip=None):
+        """网格底 + 居中提示（加载中/失败/无数据）。"""
+        for i in range(5):
+            y = T + (B - T) * i / 4
+            cv.create_line(L, y, R, y, fill="#f2f2f2")
+        cv.create_text((L + R) / 2, (T + B) / 2, text=text, fill="#999",
+                       font=("Microsoft YaHei UI", 10), justify="center")
+        if tip is not None:
+            self._chart_tip_var.set(tip)
+
+    def _draw_chart_frame(self, cv, L, R, T, B, y_min, y_max, vlines=None,
+                          skip_y=None):
+        """纵网格 + 横网格 + 右轴价格刻度。skip_y 处的刻度留给最新价价签。"""
+        for x, lab in (vlines or []):
+            cv.create_line(x, T, x, B, fill="#f3ede0")
+            cv.create_text(x, B + 10, text=lab, fill="#a8a8a8",
+                           font=("Microsoft YaHei UI", 8))
+        for i in range(5):
+            y = T + (B - T) * i / 4
+            cv.create_line(L, y, R, y, fill="#f0f0f2")
+            p = y_max - (y_max - y_min) * i / 4
+            if skip_y is not None and abs(y - skip_y) < 12:
+                continue
+            cv.create_text(R + 10, y, text=f"{p:.2f}", fill="#b0b0b0",
+                           font=("Microsoft YaHei UI", 8), anchor="w")
+        cv.create_line(R, T, R, B, fill="#e8e8ec")
+
+    def _avg_cost(self):
+        """当前持仓加权平均成本（元/克）；无持仓返回 None。"""
+        grams = float(self.cfg.get("hold_grams") or 0)
+        cost = float(self.cfg.get("hold_cost") or 0)
+        if grams > 0 and cost > 0:
+            return cost / grams
+        ta = tg = 0.0
+        for t in self.cfg.get("trades") or []:
+            ta += float(t.get("amount") or 0)
+            tg += float(t.get("grams") or 0)
+        return ta / tg if tg > 0 else None
+
+    def _avg_cost_line(self, cv, L, R, y_of, avg):
+        """单条持仓平均成本虚线（克制呈现，替代原先每笔一条）。"""
+        yc = y_of(avg)
+        cv.create_line(L, yc, R, yc, fill="#f0a35c", dash=(5, 4), width=1)
+        txt = f"持仓成本 {avg:.2f}"
+        tid = cv.create_text(L + 6, yc - 6, anchor="sw", text=txt,
+                             fill="#c2570a", font=("Microsoft YaHei UI", 8))
+        x1, y1, x2, y2 = cv.bbox(tid)
+        rid = cv.create_rectangle(x1 - 5, y1 - 2, x2 + 5, y2 + 2,
+                                  fill="#fffaf4", outline="#f3c89b")
+        cv.tag_lower(rid, tid)
+        return (x1 - 5, y1 - 2, x2 + 5, y2 + 2)
+
+    def _price_tag(self, cv, R, x, y, price, color):
+        """最新价：曲线端点圆点 + 细引线 + 右轴区圆角实心价签（同时覆盖该处刻度）。"""
+        self._dot(cv, x, y, r=4.5, color=color)
+        if x < R - 6:
+            cv.create_line(x + 5, y, R - 2, y, fill=color, width=1)
+        tag_w = 52
+        _round_rect(cv, R + 2, y - 9, R + tag_w, y + 9, 5, fill=color, outline="")
+        cv.create_text(R + tag_w / 2 - 2, y, text=f"{price:.2f}",
+                       fill="#ffffff", font=("Microsoft YaHei UI", 8, "bold"))
+
+    # ---------- 在线：黄金9999 当日分时 ----------
+    def _draw_em_trend(self, cv, L, R, T, B):
+        hidden = bool(self.cfg.get("privacy"))
+
+        def on_done(d):
+            self._render_em_trend(cv, L, R, T, B, d, hidden)
+
+        def on_wait(data, error):
+            if data is not None:
+                self._render_em_trend(cv, L, R, T, B, data, hidden)
+                return
+            if error:
+                self._chart_message(
+                    cv, L, R, T, B,
+                    f"在线行情获取失败\n{error}\n可点右上角“刷新”重试，或切换“本地采集分时”")
+            else:
+                self._chart_message(cv, L, R, T, B,
+                                    "正在从东方财富获取黄金9999分时…")
+
+        self._ensure_em("em_trend", EM_TRENDS_TTL, fetch_em_trends, on_done, on_wait)
+
+    def _render_em_trend(self, cv, L, R, T, B, d, hidden):
+        all_pts = d.get("points") or []
+        # 东财返回的“交易日”跨自然日（含前一夜盘20:00-次日2:30，周一还含周五夜盘）。
+        # 这里只画本自然日：优先取最后一个含白盘(>=09:00)的自然日；
+        # 纯夜盘时段（无白盘点）则取数据最后一天。
+        day_days = sorted({ts[:10] for ts, _ in all_pts if ts[11:16] >= "09:00"})
+        any_days = sorted({ts[:10] for ts, _ in all_pts})
+        date = day_days[-1] if day_days else (any_days[-1] if any_days else "")
+        # 积存金交易时段对应的上金所盘口：白盘 9:00-15:30、夜盘 20:00-22:30；
+        # 午间休市（11:30-13:30）与盘间休市（15:30-20:00）按点序等距压缩
+        pts = [[ts[11:16], p] for ts, p in all_pts
+               if ts[:10] == date
+               and ("08:59" <= ts[11:16] <= "15:31"
+                    or "19:59" <= ts[11:16] <= "22:30")]
+        if len(pts) < 2:
+            self._chart_message(
+                cv, L, R, T, B,
+                "当前自然日暂无盘口分时（休市）\n黄金9999：白盘 9:00-15:30 / 夜盘 20:00-次日2:30",
+                tip="在线分时由东方财富黄金9999（Au99.99）提供，周末/非交易时段无分时；"
+                    "历史走势请切“历史日K（在线）”，可回看 2020 年至今。")
+            return
+        n = len(pts)
+
+        try:
+            base = float(d.get("pre_close")) if d.get("pre_close") else None
+        except (TypeError, ValueError):
+            base = None
+        prices = [p for _, p in pts]
+        y_lo, y_hi = min(prices), max(prices)
+        if base:
+            y_lo, y_hi = min(y_lo, base), max(y_hi, base)
+        pad = max((y_hi - y_lo) * 0.15, 0.3)
+        y_min, y_max = y_lo - pad, y_hi + pad
+
+        def x_of(i):
+            return L + (R - L) * (i / (n - 1) if n > 1 else 0)
+
+        def y_of(p):
+            return T + (y_max - p) / (y_max - y_min) * (B - T)
+
+        # 时间刻度：首点/末点 + 就近的 11:30/13:30/15:30/20:00（覆盖白盘+夜盘缺口）
+        def nearest_idx(tgt):
+            tm = self._hm_to_min(tgt)
+            return min(range(n), key=lambda i: abs(self._hm_to_min(pts[i][0]) - tm))
+
+        ticks = [(0, pts[0][0]), (n - 1, pts[-1][0])]
+        for tgt in ("11:30", "13:30", "15:30", "20:00"):
+            i = nearest_idx(tgt)
+            if abs(self._hm_to_min(pts[i][0]) - self._hm_to_min(tgt)) <= 20:
+                ticks.append((i, pts[i][0]))
+        ticks = sorted(set(ticks))
+        last_p = pts[-1][1]
+        self._draw_chart_frame(cv, L, R, T, B, y_min, y_max,
+                               [(x_of(i), lab) for i, lab in ticks],
+                               skip_y=y_of(last_p))
+
+        # 顶部信息行
+        pmax, pmin = max(prices), min(prices)
+        chg_txt = ""
+        if base:
+            chg = last_p - base
+            chg_txt = f"   较昨收 {'+' if chg >= 0 else ''}{chg:.2f}（{(last_p / base - 1) * 100:+.2f}%）"
+        cv.create_text(L, 12, anchor="nw", fill="#8a6d2b",
+                       font=("Microsoft YaHei UI", 10, "bold"),
+                       text=f"黄金9999（Au99.99）在线分时  {date}"
+                            f"    最新 {last_p:.2f}   高 {pmax:.2f}   低 {pmin:.2f}{chg_txt}")
+
+        # 金色分时线 + 浅色填充
+        coords = []
+        for i, (_, p) in enumerate(pts):
+            coords.extend([x_of(i), y_of(p)])
+        cv.create_polygon(coords + [coords[-2], B, coords[0], B],
+                          fill="#f4ead1", outline="")
+        cv.create_line(coords, fill="#c9a04e", width=1.8)
+
+        # 基准线画在填充之上，保证可读
+        if base and y_min <= base <= y_max:
+            yb = y_of(base)
+            cv.create_line(L, yb, R, yb, fill="#c9c9cd", dash=(4, 3))
+            cv.create_text(L + 4, yb - 5, text=f"昨收 {base:.2f}", fill="#a8a8a8",
+                           font=("Microsoft YaHei UI", 8), anchor="sw")
+        cost_box = None
+        avg = self._avg_cost()
+        if not hidden and self._chart_cost_var.get() and avg and y_min <= avg <= y_max:
+            cost_box = self._avg_cost_line(cv, L, R, y_of, avg)
+
+        # 标签统一防碰撞布局（高低点 + 买点）；右轴价签区/成本标签预留避让
+        tag_y = y_of(last_p)
+        reserve = [(R - 6, tag_y - 12, R + 56, tag_y + 12)]
+        if cost_box:
+            reserve.append(cost_box)
+        labels = _ChartLabels(cv, L, R, T, B, reserve=reserve)
+        hi_idx = max(range(n), key=lambda i: pts[i][1])
+        lo_idx = min(range(n), key=lambda i: pts[i][1])
+        hx, hy = x_of(hi_idx), y_of(pts[hi_idx][1])
+        lx, ly = x_of(lo_idx), y_of(pts[lo_idx][1])
+        if hi_idx != n - 1:
+            labels.add(hx, hy, f"{pts[hi_idx][1]:.2f}", kind="gold")
+        if lo_idx != hi_idx and lo_idx != n - 1:
+            labels.add(lx, ly, f"{pts[lo_idx][1]:.2f}", kind="gold")
+
+        if not hidden:
+            day_trades = sorted(
+                [t for t in (self.cfg.get("trades") or [])
+                 if str(t.get("dt", ""))[:10] == date],
+                key=lambda x: x.get("dt", ""))
+            for t in day_trades:
+                amt, g = float(t.get("amount") or 0), float(t.get("grams") or 0)
+                if g <= 0:
+                    continue
+                px = amt / g
+                thm = str(t.get("dt", ""))[11:16]
+                before = [i for i in range(n) if pts[i][0] <= thm]
+                mi = before[-1] if before else 0
+                labels.add(x_of(mi), y_of(pts[mi][1]), f"买 {px:.2f} {thm}")
+        labels.flush()
+
+        # 最新价价签
+        color = "#d93025" if (base and last_p >= base) else ("#00a650" if base else "#c9a04e")
+        self._price_tag(cv, R, x_of(n - 1), y_of(last_p), last_p, color)
+
+        if hidden:
+            self._chart_tip_var.set(
+                "在线分时：东方财富黄金9999（与积存金同源，点差通常 0~1 元/克）；"
+                "隐私模式下买入点位与成本线已隐藏。")
+        else:
+            self._chart_tip_var.set(
+                "金色曲线=东方财富黄金9999在线分时（无需程序常开）｜橙点=当日买入成交价"
+                "｜橙色虚线=当前持仓加权平均成本")
+
+    # ---------- 在线：黄金9999 历史日K（收盘折线 + 全部买点） ----------
+    def _draw_em_daily(self, cv, L, R, T, B):
+        hidden = bool(self.cfg.get("privacy"))
+        trades = [t for t in (self.cfg.get("trades") or [])
+                  if float(t.get("grams") or 0) > 0]
+        dts = [str(t.get("dt", ""))[:10] for t in trades if t.get("dt")]
+        start = min(dts) if dts else (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+        beg = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=15)).strftime("%Y%m%d")
+        end = datetime.now().strftime("%Y%m%d")
+
+        def loader():
+            return fetch_em_daily(beg, end)
+
+        def on_done(kl):
+            self._render_em_daily(cv, L, R, T, B, kl, hidden)
+
+        def on_wait(data, error):
+            if data is not None:
+                self._render_em_daily(cv, L, R, T, B, data, hidden)
+                return
+            if error:
+                self._chart_message(
+                    cv, L, R, T, B,
+                    f"历史日K获取失败\n{error}\n可点右上角“刷新”重试，或切换“本地采集分时”")
+            else:
+                self._chart_message(cv, L, R, T, B, "正在从东方财富获取黄金9999历史日K…")
+
+        self._ensure_em("em_daily", EM_KLINE_TTL, loader, on_done, on_wait)
+
+    def _render_em_daily(self, cv, L, R, T, B, kl, hidden):
+        if not kl:
+            self._chart_message(cv, L, R, T, B, "暂无历史日K数据")
+            return
+        n = len(kl)
+        closes = [r[2] for r in kl]
+        y_lo, y_hi = min(closes), max(closes)
+        pad = max((y_hi - y_lo) * 0.08, 0.5)
+        y_min, y_max = y_lo - pad, y_hi + pad
+
+        def x_of(i):
+            return L + (R - L) * (i / (n - 1) if n > 1 else 0)
+
+        def y_of(p):
+            return T + (y_max - p) / (y_max - y_min) * (B - T)
+
+        # 约 6 个日期刻度
+        tick_idxs = sorted({int(round(i * (n - 1) / 5)) for i in range(6)})
+        vlines = [(x_of(i), kl[i][0][5:10]) for i in tick_idxs]
+        last_c = closes[-1]
+        self._draw_chart_frame(cv, L, R, T, B, y_min, y_max, vlines,
+                               skip_y=y_of(last_c))
+
+        # 顶部信息行
+        cv.create_text(L, 12, anchor="nw", fill="#8a6d2b",
+                       font=("Microsoft YaHei UI", 10, "bold"),
+                       text=f"黄金9999（Au99.99）历史日K  {kl[0][0]} ~ {kl[-1][0]}"
+                            f"    {n} 个交易日    最新 {last_c:.2f}")
+
+        # 金色收盘折线 + 浅色填充
+        coords = []
+        for i, c in enumerate(closes):
+            coords.extend([x_of(i), y_of(c)])
+        cv.create_polygon(coords + [coords[-2], B, coords[0], B],
+                          fill="#f4ead1", outline="")
+        cv.create_line(coords, fill="#c9a04e", width=1.8)
+
+        # 持仓平均成本线画在填充之上
+        cost_box = None
+        avg = self._avg_cost()
+        if not hidden and self._chart_cost_var.get() and avg and y_min <= avg <= y_max:
+            cost_box = self._avg_cost_line(cv, L, R, y_of, avg)
+
+        # 标签统一防碰撞布局（区间高低点 + 全部买点）；右轴价签区/成本标签预留避让
+        tag_y = y_of(last_c)
+        reserve = [(R - 6, tag_y - 12, R + 56, tag_y + 12)]
+        if cost_box:
+            reserve.append(cost_box)
+        labels = _ChartLabels(cv, L, R, T, B, reserve=reserve)
+        hi_idx = max(range(n), key=lambda i: closes[i])
+        lo_idx = min(range(n), key=lambda i: closes[i])
+        hx, hy = x_of(hi_idx), y_of(closes[hi_idx])
+        lx, ly = x_of(lo_idx), y_of(closes[lo_idx])
+        if hi_idx != n - 1:
+            labels.add(hx, hy, f"{closes[hi_idx]:.2f}", kind="gold")
+        if lo_idx != hi_idx and lo_idx != n - 1:
+            labels.add(lx, ly, f"{closes[lo_idx]:.2f}", kind="gold")
+
+        if not hidden:
+            all_dates = [r[0] for r in kl]
+            date_to_i = {d: i for i, d in enumerate(all_dates)}
+
+            def day_index(ds):
+                if ds in date_to_i:
+                    return date_to_i[ds]
+                before = [i for i, d in enumerate(all_dates) if d <= ds]
+                return before[-1] if before else 0
+
+            day_rank = {}
+            day_count = {}
+            for t in (self.cfg.get("trades") or []):
+                ds = str(t.get("dt", ""))[:10]
+                day_count[ds] = day_count.get(ds, 0) + 1
+            for t in sorted(self.cfg.get("trades") or [], key=lambda x: x.get("dt", "")):
+                amt, g = float(t.get("amount") or 0), float(t.get("grams") or 0)
+                if g <= 0:
+                    continue
+                px = amt / g
+                dt = str(t.get("dt", ""))
+                ds, dshort = dt[:10], dt[5:10]
+                di = day_index(ds)
+                rank = len(day_rank.setdefault(ds, []))
+                day_rank[ds].append(t)
+                jitter = (rank - (day_count.get(ds, 1) - 1) / 2) * 8
+                labels.add(x_of(di) + jitter, y_of(closes[di]),
+                           f"买 {px:.2f}  {dshort}")
+        labels.flush()
+
+        # 最新价价签（较前一交易日涨跌着色）
+        if n >= 2:
+            color = "#d93025" if last_c >= closes[-2] else "#00a650"
+        else:
+            color = "#c9a04e"
+        self._price_tag(cv, R, x_of(n - 1), y_of(last_c), last_c, color)
+
+        if hidden:
+            self._chart_tip_var.set(
+                "历史日K：东方财富黄金9999收盘价（2020年至今可查）；隐私模式下买入点位已隐藏。")
+        else:
+            self._chart_tip_var.set(
+                "金色曲线=东方财富黄金9999日收盘价｜橙点=每笔买入成交价（定位到成交当日，节假日顺延），"
+                "标签自动避让、引线连到买点｜橙色虚线=当前持仓加权平均成本")
+
+    # ---------- 本地采集分时（程序运行期间累积，兜底） ----------
+    def _draw_local(self, cv, L, R, T, B):
+        selected = self._chart_day_var.get() if self._chart_day_var else ""
+        pts = list(self._hist.get(selected, []))
+        # 当日：把内存中最新价也补进曲线（尚未到下一分钟落盘时）
+        latest_day = self._trade_date
+        if selected == latest_day and self._latest_sell:
+            now_hm = datetime.now().strftime("%H:%M")
+            if in_trade_session(now_hm):
+                if pts and pts[-1][0] == now_hm:
+                    pts[-1][1] = float(self._latest_sell)
+                elif not pts or pts[-1][0] < now_hm:
+                    pts.append([now_hm, float(self._latest_sell)])
+        is_today = bool(selected and selected == latest_day)
+        hidden = bool(self.cfg.get("privacy"))
+
+        # 顶部信息行
+        if pts:
+            pmax = max(p for _, p in pts)
+            pmin = min(p for _, p in pts)
+            last_p = pts[-1][1]
+            base = self.cfg.get("today_base") if selected == self.cfg.get("today_base_date") else None
+            chg_txt = ""
+            if base:
+                chg = last_p - base
+                chg_txt = f"   较昨收 {'+' if chg >= 0 else ''}{chg:.2f}（{(last_p / base - 1) * 100:+.2f}%）"
+            cv.create_text(L, 12, anchor="nw", fill="#8a6d2b",
+                           font=("Microsoft YaHei UI", 10, "bold"),
+                           text=f"工银积存金 · 赎回价  {selected}"
+                                f"    最新 {last_p:.2f}   高 {pmax:.2f}   低 {pmin:.2f}{chg_txt}")
+
+        # 时间轴：09:10 / 13:00 / 18:00 / 22:30
+        total = trade_minutes()
+
+        def x_of(hm):
+            tm = self._hm_to_min(hm) - (9 * 60 + 10)
+            return L + min(max(tm / total, 0), 1) * (R - L)
+
+        vlines = [(x_of(t), t) for t in ("09:10", "13:00", "18:00", "22:30")]
+
+        if len(pts) < 1:
+            self._draw_chart_frame(cv, L, R, T, B, 0, 1, vlines)
+            cv.create_text((L + R) / 2, (T + B) / 2,
+                           text="该交易日暂无本地分时数据\n可切换“今日分时（在线）”直接查看，无需程序常开",
+                           fill="#aaa", font=("Microsoft YaHei UI", 10), justify="center")
+            self._chart_tip_var.set(
+                "本地分时需程序运行期间按分钟采集；在线模式（今日分时/历史日K）由东方财富提供，"
+                "随时可看、无需常驻。")
+            days = sorted(set(list(self._hist.keys()) + ([latest_day] if latest_day else [])),
+                          reverse=True)
+            self._chart_combo.configure(values=days)
+            return
+
+        # y 轴范围（纳入昨收基准；历史成本线不纳入，保持走势本身的缩放）
+        prices = [p for _, p in pts]
+        y_lo, y_hi = min(prices), max(prices)
+        if base:
+            y_lo, y_hi = min(y_lo, base), max(y_hi, base)
+        pad = max((y_hi - y_lo) * 0.15, 0.3)
+        y_min, y_max = y_lo - pad, y_hi + pad
+
+        def y_of(p):
+            return T + (y_max - p) / (y_max - y_min) * (B - T)
+
+        lhm, lpv = pts[-1]
+        self._draw_chart_frame(cv, L, R, T, B, y_min, y_max, vlines,
+                               skip_y=y_of(lpv))
+        # 金色分时线 + 浅色填充
+        coords = []
+        for hm, p in pts:
+            coords.extend([x_of(hm), y_of(p)])
+        fill_pts = coords + [coords[-2], B, coords[0], B]
+        cv.create_polygon(fill_pts, fill="#f4ead1", outline="")
+        cv.create_line(coords, fill="#c9a04e", width=1.8)
+
+        # 基准线画在填充之上
+        if base and y_min <= base <= y_max:
+            yb = y_of(base)
+            cv.create_line(L, yb, R, yb, fill="#c9c9cd", dash=(4, 3))
+            cv.create_text(L + 4, yb - 5, text=f"昨收 {base:.2f}", fill="#a8a8a8",
+                           font=("Microsoft YaHei UI", 8), anchor="sw")
+        cost_box = None
+        avg = self._avg_cost()
+        if is_today and not hidden and self._chart_cost_var.get() \
+                and avg and y_min <= avg <= y_max:
+            cost_box = self._avg_cost_line(cv, L, R, y_of, avg)
+
+        # 标签统一防碰撞布局（高低点 + 买点）；右轴价签区/成本标签预留避让
+        tag_y = y_of(lpv)
+        reserve = [(R - 6, tag_y - 12, R + 56, tag_y + 12)]
+        if cost_box:
+            reserve.append(cost_box)
+        labels = _ChartLabels(cv, L, R, T, B, reserve=reserve)
+        hi_idx = max(range(len(pts)), key=lambda i: pts[i][1])
+        lo_idx = min(range(len(pts)), key=lambda i: pts[i][1])
+        hx, hy = x_of(pts[hi_idx][0]), y_of(pts[hi_idx][1])
+        lx, ly = x_of(pts[lo_idx][0]), y_of(pts[lo_idx][1])
+        last_i = len(pts) - 1
+        if hi_idx != last_i:
+            labels.add(hx, hy, f"{pts[hi_idx][1]:.2f}", kind="gold")
+        if lo_idx != hi_idx and lo_idx != last_i:
+            labels.add(lx, ly, f"{pts[lo_idx][1]:.2f}", kind="gold")
+
+        today_trades = [t for t in (self.cfg.get("trades") or [])
+                        if str(t.get("dt", "")).startswith(selected)]
+        if not hidden:
+            for t in sorted(today_trades, key=lambda x: x.get("dt", "")):
+                amt, g = float(t.get("amount") or 0), float(t.get("grams") or 0)
+                if g <= 0:
+                    continue
+                px = amt / g
+                thm = str(t.get("dt", ""))[11:16]
+                # 点位取成交时刻最近的本地采集价；没有本地数据时回退买入价
+                near = [p for hm, p in pts if hm <= thm]
+                mp = near[-1] if near else px
+                mp = min(max(mp, y_min), y_max)
+                labels.add(x_of(thm), y_of(mp), f"买 {px:.2f} {thm}")
+        labels.flush()
+
+        # 最新价圆点与右侧价签
+        up_color = "#d93025" if (base and lpv >= base) else ("#00a650" if base else "#c9a04e")
+        self._price_tag(cv, R, x_of(lhm), y_of(lpv), lpv, up_color)
+
+        # 日期下拉补充新出现的交易日，保留当前选择
+        days = sorted(set(list(self._hist.keys()) + ([latest_day] if latest_day else [])),
+                      reverse=True)
+        cur_vals = list(self._chart_combo.cget("values"))
+        if cur_vals != tuple(days) and cur_vals != days:
+            self._chart_combo.configure(values=days)
+
+        if hidden:
+            self._chart_tip_var.set(
+                "金色曲线为本地采集的实时赎回价（公开行情）；隐私模式下买入点位与成本线已隐藏。")
+        else:
+            self._chart_tip_var.set(
+                "金色曲线=本地按分钟采集的赎回价（仅程序运行期间有数据，建议用在线模式）"
+                "｜橙点=当日买入成交价，标签自动避让｜橙色虚线=当前持仓加权平均成本")
+
+    def _add_trade(self):
+        win = tk.Toplevel(self.root)
+        win.title("添加补仓记录")
+        win.geometry("310x300")
+        win.resizable(False, False)
+        win.configure(bg="#f5f5f7")
+        win.transient(self._trades_win or self.root)
+        win.grab_set()
+
+        dt_var = tk.StringVar(value=f"{datetime.now():%Y-%m-%d %H:%M}")
+        amt_var = tk.StringVar(value="5000")
+        grams_var = tk.StringVar(value="")
+        sync_var = tk.BooleanVar(value=True)
+        buy_px = self._latest_data.get("jicun_active")
+
+        def form_row(r, label, var, hint=None):
+            tk.Label(win, text=label, bg="#f5f5f7",
+                     font=("Microsoft YaHei UI", 9)).grid(
+                row=r, column=0, sticky="w", padx=16, pady=(12, 0))
+            ttk.Entry(win, textvariable=var, width=17).grid(
+                row=r, column=1, padx=8, pady=(12, 0))
+            if hint:
+                tk.Label(win, text=hint, bg="#f5f5f7", fg="#999",
+                         font=("Microsoft YaHei UI", 8)).grid(
+                    row=r + 1, column=1, sticky="w", padx=8)
+
+        form_row(0, "买入时间", dt_var)
+        form_row(2, "金额(元)", amt_var)
+        form_row(4, "克数(克)", grams_var,
+                 "留空则按实时买入价倒算" + (f"（当前 {buy_px:g}）" if buy_px else "，暂无报价需手填"))
+        ttk.Checkbutton(win, text="同时计入总持仓克数与成本", variable=sync_var).grid(
+            row=6, column=0, columnspan=2, sticky="w", padx=14, pady=(10, 0))
+
+        def on_save():
+            try:
+                amt = float(amt_var.get())
+                g = float(grams_var.get()) if grams_var.get().strip() else 0.0
+                if amt <= 0 or g < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("添加补仓", "请填写有效的金额/克数。", parent=win)
+                return
+            if g <= 0:
+                if not buy_px:
+                    messagebox.showwarning("添加补仓", "暂无实时买入价，请手动填写克数。", parent=win)
+                    return
+                g = amt / buy_px
+            rec = {"dt": dt_var.get().strip() or f"{datetime.now():%Y-%m-%d %H:%M}",
+                   "amount": round(amt, 2), "grams": round(g, 4)}
+            trades = self.cfg.setdefault("trades", [])
+            trades.append(rec)
+            trades.sort(key=lambda x: x.get("dt", ""), reverse=True)
+            if sync_var.get():
+                self.cfg["hold_grams"] = float(self.cfg.get("hold_grams") or 0) + g
+                self.cfg["hold_cost"] = float(self.cfg.get("hold_cost") or 0) + amt
+            self._persist()
+            self._render_position()
+            self._refresh_trades()
+            win.destroy()
+
+        ttk.Button(win, text="保存", command=on_save).grid(row=7, column=0, pady=16)
+        ttk.Button(win, text="取消", command=win.destroy).grid(row=7, column=1)
+
+    def _delete_trade(self):
+        tree = self._trades_tree
+        sel = tree.selection()
+        if not sel or not sel[0].startswith("t"):
+            messagebox.showinfo("删除补仓", "请先选中一笔补仓记录。", parent=self._trades_win)
+            return
+        t = self.cfg["trades"][int(sel[0][1:])]
+        if not messagebox.askyesno(
+                "删除补仓",
+                f"删除 {t.get('dt', '')} 买入 {float(t.get('amount') or 0):,.0f} 元的记录？\n"
+                "总持仓克数与成本将同步扣减（底仓相应增加）。",
+                parent=self._trades_win):
+            return
+        self.cfg["hold_grams"] = max(
+            0.0, float(self.cfg.get("hold_grams") or 0) - float(t.get("grams") or 0))
+        self.cfg["hold_cost"] = max(
+            0.0, float(self.cfg.get("hold_cost") or 0) - float(t.get("amount") or 0))
+        del self.cfg["trades"][int(sel[0][1:])]
+        self._persist()
+        self._render_position()
+        self._refresh_trades()
+
+    def _render_position(self):
+        """根据最新赎回价计算并刷新持仓卡片。"""
+        sell = self._latest_sell
+        grams = float(self.cfg.get("hold_grams") or 0)
+        cost = float(self.cfg.get("hold_cost") or 0)
+        if not sell or grams <= 0:
+            self.pos_mv_var.set("实时市值 --")
+            self.pos_pl_var.set("持有收益 --")
+            self.pos_today_var.set("今日盈亏 --")
+            self.pos_pl_pct_var.set("")
+            self.pos_info_var.set("")
+            return
+
+        if self.cfg.get("privacy"):
+            # 隐私模式：市值/收益/成本/克数全部打码，仅保留公开行情（赎回价、日内高低）
+            self.pos_mv_var.set("实时市值 ****")
+            self.pos_pl_var.set("持有收益 ****（成本 **** 元/克）")
+            self.pos_pl_label.configure(fg="#888")
+            self.pos_pl_pct_var.set("收益率 **")
+            self.pos_today_var.set("今日盈亏 ****")
+            self.pos_today_label.configure(fg="#888")
+            self.pos_info_var.set(
+                f"持仓 ** 克｜赎回价 {sell:.2f} 元/克｜日内 "
+                f"{self._latest_high:.2f} ~ {self._latest_low:.2f}")
+            return
+
+        mv = grams * sell
+        pl = mv - cost
+        cost_px = cost / grams
+        self.pos_mv_var.set(f"实时市值 {mv:,.2f} 元")
+        sign = "+" if pl >= 0 else ""
+        self.pos_pl_var.set(f"持有收益 {sign}{pl:,.2f} 元（成本 {cost_px:.2f} 元/克）")
+        self.pos_pl_label.configure(fg="#d93025" if pl >= 0 else "#00a650")
+        self.pos_pl_pct_var.set(f"收益率 {sign}{pl / cost * 100:.2f}%" if cost else "")
+
+        # 今日盈亏（与支付宝同口径）：昨日存量按昨收基准价，
+        # 今日新买入的克数按其成交价（金额÷克数倒算）起算
+        base = self.cfg.get("today_base")
+        today_date = self.cfg.get("today_base_date")
+        today_pl = None
+        if base:
+            old_g = grams
+            today_pl = 0.0
+            for t in self.cfg.get("trades") or []:
+                if str(t.get("dt", ""))[:10] != today_date:
+                    continue
+                g_t = float(t.get("grams") or 0)
+                a_t = float(t.get("amount") or 0)
+                if g_t > 0:
+                    today_pl += g_t * (sell - a_t / g_t)
+                    old_g -= g_t
+            today_pl += max(old_g, 0.0) * (sell - base)
+        if today_pl is not None:
+            tsign = "+" if today_pl >= 0 else ""
+            self.pos_today_var.set(f"今日盈亏 {tsign}{today_pl:,.2f} 元")
+            self.pos_today_label.configure(fg="#d93025" if today_pl >= 0 else "#00a650")
+        else:
+            self.pos_today_var.set("今日盈亏 --")
+            self.pos_today_label.configure(fg="#888")
+
+        self.pos_info_var.set(
+            f"持仓 {grams:g} 克｜赎回价 {sell:.2f} 元/克｜日内 "
+            f"{self._latest_high:.2f} ~ {self._latest_low:.2f}")
+
+    # ---- 托盘 ----
+    def _make_icon_image(self):
+        from PIL import Image, ImageDraw
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse((4, 4, 60, 60), fill=(199, 0, 11, 255))
+        d.text((17, 16), "金", fill=(255, 255, 255, 255))
+        return img
+
+    def _build_tray(self):
+        try:
+            import pystray
+        except ImportError:
+            self.tray = None
+            return
+
+        menu = pystray.Menu(
+            pystray.MenuItem("显示主窗口", self._tray_show, default=True),
+            pystray.MenuItem("立即刷新", lambda: self.root.after(0, self._poll_once)),
+            pystray.MenuItem("退出", self._tray_quit),
+        )
+        self.tray = pystray.Icon(APP_NAME, self._make_icon_image(), APP_NAME, menu)
+        threading.Thread(target=self.tray.run, daemon=True).start()
+
+    def _tray_show(self, *_):
+        self.root.after(0, self.show_window)
+
+    def _tray_quit(self, *_):
+        self.root.after(0, self.quit_app)
+
+    def show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def hide_window(self):
+        self.root.withdraw()
+
+    def quit_app(self):
+        self.stop_event.set()
+        try:
+            if self.tray:
+                self.tray.stop()
+        except Exception:
+            pass
+        self._persist()
+        if self._hist_dirty:
+            save_history(self._hist)
+        self.root.destroy()
+
+    # ---- 取价轮询 ----
+    def _poll_once(self):
+        if self.stop_event.is_set():
+            return
+        self.status_var.set("正在获取行情…")
+        threading.Thread(target=self._fetch_worker, daemon=True).start()
+
+    def _fetch_worker(self):
+        try:
+            data = fetch_prices()
+            self.root.after(0, lambda: self._on_data(data))
+        except Exception as e:
+            self.failed_count += 1
+            self.root.after(0, lambda: self._on_fetch_error(e))
+
+    def _on_fetch_error(self, err):
+        self.status_var.set(
+            f"[{datetime.now():%H:%M:%S}] 行情获取失败（连续 {self.failed_count} 次）：{err}")
+        self._schedule_next()
+
+    def _on_data(self, data):
+        self.failed_count = 0
+        key = self.cfg["source"]
+        price = data.get(key)
+        ts = data.get("time", "")
+
+        self.time_var.set(f"更新于 {ts}" + (f"   {data.get('date', '')}" if data.get("date") else ""))
+        if data.get("high"):
+            self.hl_var.set(f"日内最高 {data['high']:.2f}")
+        if data.get("low"):
+            self.ll_var.set(f"日内最低 {data['low']:.2f}")
+
+        # 持仓估值始终按积存金赎回价（独立于监控品种）
+        self._latest_data = data
+        self._latest_sell = data.get("jicun_sell")
+        self._latest_high = data.get("high") or 0.0
+        self._latest_low = data.get("low") or 0.0
+        # 本地分时采集（仅交易时段，按分钟去重，约每分钟落盘一次）
+        day, hm = data.get("date"), (ts[:5] if ts else "")
+        sell0 = data.get("jicun_sell")
+        if sell0 and day and in_trade_session(hm):
+            if append_history_point(self._hist, day, hm, sell0):
+                self._hist_dirty = True
+            now_ts = datetime.now().timestamp()
+            if self._hist_dirty and now_ts - self._last_hist_save >= 60:
+                save_history(self._hist)
+                self._hist_dirty = False
+                self._last_hist_save = now_ts
+        self._roll_today_base(data.get("date"))
+        self._render_position()
+        if self._trades_win is not None:
+            self._refresh_trades()
+        if self._chart_win is not None:
+            self._draw_chart()
+
+        if price is None:
+            self.price_var.set("--")
+            self.status_var.set(f"[{ts}] 当前品种暂无报价（可能不在交易时段：周一至周五 9:10-22:30）")
+            self._schedule_next()
+            return
+
+        prev = self.last_price
+        self.price_var.set(f"{price:.2f}")
+        if prev is not None and price != prev:
+            diff = price - prev
+            color = "#00a650" if diff < 0 else "#d93025"
+            self.chg_var.set(f"较上次 {'↓' if diff < 0 else '↑'} {abs(diff):.2f}")
+            self.price_label.configure(fg=color)
+
+        # 首次成功取价：建立基线，不弹窗
+        if not self.baseline_set or prev is None:
+            self.baseline_set = True
+            self.last_price = price
+            self.cfg["last_price"] = price
+            self._persist()
+            bucket = math.floor(price / self.cfg["step"]) * self.cfg["step"]
+            self.status_var.set(
+                f"[{ts}] 已建立监控基线 {price:.2f}，跌破 {bucket:.0f} 元档时首次提醒。")
+            self._schedule_next()
+            return
+
+        # 档位穿越检测
+        try:
+            step = float(self.step_var.get())
+            if step <= 0:
+                step = self.cfg["step"]
+        except ValueError:
+            step = self.cfg["step"]
+        if step != self.cfg["step"]:
+            self.cfg["step"] = step
+            self._persist()
+
+        tiers = crossed_tiers(prev, price, step)
+        if tiers:
+            self._fire_alerts(price, tiers, data, ts)
+
+        self.last_price = price
+        self.cfg["last_price"] = price
+        self._persist()
+        self.status_var.set(f"[{ts}] 监控中：当前 {price:.2f}，每 {step:g} 元一档。")
+        self._schedule_next()
+
+    def _fire_alerts(self, price, tiers, data, ts):
+        name = SOURCES[self.cfg["source"]]["name"]
+        unit = SOURCES[self.cfg["source"]]["unit"]
+        # 一次轮询可能跨多档：合并为一条弹窗，逐档列示
+        lines = "\n".join(f"跌破 {t:g} 元" for t in tiers)
+        msg = f"当前 {price:.2f} {unit}\n{lines}"
+        # 附带持仓实时浮盈（按赎回价）
+        sell = self._latest_sell
+        grams = float(self.cfg.get("hold_grams") or 0)
+        cost = float(self.cfg.get("hold_cost") or 0)
+        pl_txt = ""
+        if self.cfg.get("privacy"):
+            pl_txt = "\n持仓浮盈 ****（** 克）"
+        elif sell and grams > 0 and cost > 0:
+            pl = grams * sell - cost
+            pl_txt = f"\n持仓浮盈 {pl:+,.2f} 元（{grams:g} 克）"
+        self.toasts.show("金价跌破档位提醒", f"{name}\n{msg}{pl_txt}", duration_ms=15000)
+        if self.sound_var.get():
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                self.root.bell()
+
+        # 更新托盘 tooltip
+        if self.tray:
+            try:
+                tip = f"{APP_NAME}｜{price:.2f}（跌破 {tiers[0]:g}）"
+                if self.cfg.get("privacy"):
+                    tip += "｜浮盈 ****"
+                elif sell and grams > 0 and cost > 0:
+                    tip += f"｜浮盈 {grams * sell - cost:+,.0f}"
+                self.tray.title = tip
+            except Exception:
+                pass
+
+    def _test_alert(self):
+        self.toasts.show(
+            "金价跌破档位提醒（测试）",
+            f"{SOURCES[self.cfg['source']]['name']}\n当前 880.00 元/克\n跌破 890 元",
+            duration_ms=8000,
+        )
+        if self.sound_var.get():
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                self.root.bell()
+
+    def _schedule_next(self):
+        try:
+            interval = max(5, int(float(self.interval_var.get())))
+        except ValueError:
+            interval = self.cfg["interval"]
+        if interval != self.cfg["interval"]:
+            self.cfg["interval"] = interval
+            self._persist()
+        if not self.stop_event.is_set():
+            self.root.after(interval * 1000, self._poll_once)
+
+    def _persist(self):
+        self.cfg["sound"] = bool(self.sound_var.get())
+        save_config(self.cfg)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def _enable_dpi():
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                import ctypes
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+
+def _cli_test():
+    """命令行自检：python gold_monitor.py --check"""
+    data = fetch_prices()
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    if "--check" in sys.argv:
+        _cli_test()
+    else:
+        _enable_dpi()
+        GoldMonitorApp().run()

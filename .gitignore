@@ -1,0 +1,12 @@
+# 运行时本地数据（含个人持仓/交易，请勿提交）
+config.json
+price_history.json
+
+# 打包产物（PyInstaller）
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
