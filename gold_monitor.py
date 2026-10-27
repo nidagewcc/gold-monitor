@@ -1247,6 +1247,7 @@ class GoldMonitorApp:
         if win is None or not tk.Toplevel.winfo_exists(win):
             return
         tree = self._trades_tree
+        prev_sel = tree.selection()  # 定时刷新会重建整表，先记下选中行，重建后恢复
         tree.delete(*tree.get_children())
         sell = self._latest_sell
         trades = self.cfg.get("trades") or []
@@ -1326,6 +1327,11 @@ class GoldMonitorApp:
         else:
             self._trades_tip_var.set(
                 "暂无实时赎回价（非交易时段），浮盈显示 --｜买入价按“金额÷克数”倒算")
+
+        # 重建后恢复此前选中（仅当该行仍存在），避免轮询刷新导致“删除选中”失效
+        for sid in prev_sel:
+            if tree.exists(sid):
+                tree.selection_add(sid)
 
     def _close_trades(self):
         win = self._trades_win
@@ -2046,10 +2052,18 @@ class GoldMonitorApp:
     def _delete_trade(self):
         tree = self._trades_tree
         sel = tree.selection()
-        if not sel or not sel[0].startswith("t"):
-            messagebox.showinfo("删除补仓", "请先选中一笔补仓记录。", parent=self._trades_win)
+        # 严格匹配补仓行 iid（"t0"/"t1"…），排除 "total" 等以 t 开头的合计/底仓行
+        idx = None
+        if sel:
+            sid = sel[0]
+            if sid.startswith("t") and sid[1:].isdigit():
+                idx = int(sid[1:])
+        trades = self.cfg.get("trades") or []
+        if idx is None or not (0 <= idx < len(trades)):
+            messagebox.showinfo("删除补仓", "请先选中一笔补仓记录（合计、底仓行不可删除）。",
+                                parent=self._trades_win)
             return
-        t = self.cfg["trades"][int(sel[0][1:])]
+        t = trades[idx]
         if not messagebox.askyesno(
                 "删除补仓",
                 f"删除 {t.get('dt', '')} 买入 {float(t.get('amount') or 0):,.0f} 元的记录？\n"
@@ -2060,7 +2074,8 @@ class GoldMonitorApp:
             0.0, float(self.cfg.get("hold_grams") or 0) - float(t.get("grams") or 0))
         self.cfg["hold_cost"] = max(
             0.0, float(self.cfg.get("hold_cost") or 0) - float(t.get("amount") or 0))
-        del self.cfg["trades"][int(sel[0][1:])]
+        del trades[idx]
+        self.cfg["trades"] = trades
         self._persist()
         self._render_position()
         self._refresh_trades()
