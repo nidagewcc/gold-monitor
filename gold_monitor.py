@@ -110,6 +110,129 @@ DEFAULT_CONFIG = {
 # 2026-08-28 阶段性优惠公告明确该费率保持 0.5% 不变）
 REDEEM_FEE_RATE = 0.005
 
+# ---------- 黑金搞钱风主题 ----------
+C_BG       = "#0f1014"   # 窗口底色（深炭黑）
+C_CARD     = "#191b21"   # 卡片底色
+C_CARD_2   = "#23262f"   # 输入框/次级控件底色
+C_LINE     = "#2e313b"   # 描边/分隔线
+C_GOLD     = "#e3c06a"   # 主金色
+C_GOLD_HI  = "#f6dfa0"   # 高亮金（大数字）
+C_GOLD_DIM = "#9c7f3a"   # 暗金（弱提示/描边）
+C_TXT      = "#ece8dd"   # 主文字（暖白）
+C_TXT_2    = "#9b968a"   # 次要文字
+C_TXT_3    = "#6f6b61"   # 弱化文字
+C_UP       = "#ff6259"   # 涨/盈利（中国习惯红，深色底上提亮）
+C_DOWN     = "#35cc8e"   # 跌/亏损（亮绿）
+C_CHART    = "#14151b"   # 走势图画布底色
+FONT       = "Microsoft YaHei UI"
+
+
+def _dark_title(win):
+    """让 Windows 窗口标题栏跟随深色模式（Win10 2004+ / Win11 生效，旧版静默忽略）。"""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
+        val = ctypes.c_int(1)
+        dwm = ctypes.windll.dwmapi
+        # Win11/较新 Win10 用 20，旧版 Win10 2004 用 19，都试一遍
+        for attr in (20, 19):
+            dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
+    except Exception:
+        pass
+
+
+def dark_checkbutton(parent, text, variable, bg=C_BG, fg=C_TXT,
+                     command=None, on_color=C_GOLD):
+    """黑金风自绘复选框：未选中暗色空心框，选中金底黑勾。
+    避开 clam 主题 ttk.Checkbutton 在高 DPI 下选中态渲染异常的问题。"""
+    box = tk.Frame(parent, bg=bg, cursor="hand2")
+    mark = tk.Label(box, text="✓", width=2, height=1,
+                    font=(FONT, 9, "bold"), bd=0, padx=0, pady=0,
+                    highlightthickness=1)
+
+    def redraw(_=None):
+        if variable.get():
+            mark.configure(bg=on_color, fg="#17120a", highlightbackground=on_color)
+        else:
+            mark.configure(bg=C_CARD_2, fg=C_CARD_2, highlightbackground=C_LINE)
+
+    mark.pack(side="left")
+    lab = tk.Label(box, text=text, bg=bg, fg=fg, font=(FONT, 9))
+    lab.pack(side="left", padx=(6, 0))
+
+    def toggle(_=None):
+        variable.set(not variable.get())
+        redraw()
+        if command:
+            command()
+
+    for w in (mark, lab, box):
+        w.bind("<Button-1>", toggle)
+    variable.trace_add("write", lambda *_: redraw())
+    redraw()
+    return box
+
+
+def apply_dark_style(root):
+    """全局 ttk 深色样式（clam 主题最听配色的话，vista 主题会强塞系统白皮）。"""
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure(".", background=C_BG, foreground=C_TXT,
+                    bordercolor=C_LINE, focuscolor="", lightcolor=C_LINE,
+                    darkcolor=C_LINE)
+    style.configure("TFrame", background=C_BG)
+    style.configure("TButton", padding=(12, 5), background=C_CARD_2,
+                    foreground=C_TXT, bordercolor=C_LINE, focusthickness=0,
+                    font=(FONT, 9))
+    style.map("TButton",
+              background=[("active", "#3a4050"), ("pressed", "#333845")],
+              foreground=[("active", C_GOLD_HI)])
+    style.configure("Gold.TButton", background=C_GOLD, foreground="#17120a",
+                    bordercolor=C_GOLD, font=(FONT, 9, "bold"), padding=(12, 5))
+    style.map("Gold.TButton", background=[("active", C_GOLD_HI)])
+    style.configure("TEntry", fieldbackground=C_CARD_2, foreground=C_TXT,
+                    insertcolor=C_TXT, bordercolor=C_LINE, padding=3)
+    style.configure("TCombobox", fieldbackground=C_CARD_2, background=C_CARD_2,
+                    foreground=C_TXT, arrowcolor=C_GOLD, bordercolor=C_LINE,
+                    selectbackground=C_GOLD_DIM, selectforeground="#ffffff",
+                    insertcolor=C_TXT, padding=3)
+    style.map("TCombobox",
+              fieldbackground=[("readonly", C_CARD_2)],
+              foreground=[("focus", C_TXT), ("readonly", C_TXT)],
+              selectbackground=[("focus", C_GOLD_DIM)])
+    style.configure("TSpinbox", fieldbackground=C_CARD_2, foreground=C_TXT,
+                    arrowcolor=C_GOLD, bordercolor=C_LINE, insertcolor=C_TXT)
+    style.configure("TCheckbutton", background=C_BG, foreground=C_TXT,
+                    indicatorcolor=C_CARD_2, bordercolor=C_LINE)
+    style.map("TCheckbutton",
+              background=[("active", C_BG)],
+              indicatorcolor=[("selected", C_GOLD)])
+    style.configure("Card.TCheckbutton", background=C_CARD, foreground=C_TXT,
+                    indicatorcolor=C_CARD_2)
+    style.map("Card.TCheckbutton",
+              background=[("active", C_CARD)],
+              indicatorcolor=[("selected", C_GOLD)])
+    style.configure("Vertical.TScrollbar", background=C_CARD_2,
+                    troughcolor=C_BG, arrowcolor=C_TXT_2, bordercolor=C_BG)
+    style.map("Vertical.TScrollbar", background=[("active", "#3a4050")])
+    style.configure("Treeview", background=C_CARD, fieldbackground=C_CARD,
+                    foreground=C_TXT, bordercolor=C_LINE, borderwidth=0,
+                    rowheight=26, font=(FONT, 9))
+    style.configure("Treeview.Heading", background=C_CARD_2, foreground=C_GOLD,
+                    relief="flat", font=(FONT, 9, "bold"), padding=(4, 5))
+    style.map("Treeview.Heading", background=[("active", "#333845")])
+    style.map("Treeview",
+              background=[("selected", "#3d3522")],
+              foreground=[("selected", C_GOLD_HI)])
+    # Combobox 弹出的下拉列表是独立 Tk 列表控件，只能走 option 这条路
+    root.option_add("*TCombobox*Listbox.background", C_CARD_2)
+    root.option_add("*TCombobox*Listbox.foreground", C_TXT)
+    root.option_add("*TCombobox*Listbox.selectBackground", C_GOLD_DIM)
+    root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+    root.option_add("*TCombobox*Listbox.font", (FONT, 9))
+
 
 # ---------- 数据抓取 ----------
 
@@ -561,20 +684,20 @@ class ToastManager:
         except tk.TclError:
             pass
 
-        frame = tk.Frame(win, bg="#ffffff", highlightbackground="#c7000b",
+        frame = tk.Frame(win, bg=C_CARD, highlightbackground=C_GOLD,
                          highlightthickness=1, bd=0)
         frame.pack(fill="both", expand=True)
 
-        top = tk.Frame(frame, bg="#c7000b", height=30)
+        top = tk.Frame(frame, bg=C_GOLD, height=30)
         top.pack(fill="x")
-        tk.Label(top, text=title, bg="#c7000b", fg="#ffffff",
-                font=("Microsoft YaHei UI", 10, "bold")).pack(side="left", padx=10, pady=4)
-        close = tk.Label(top, text="✕", bg="#c7000b", fg="#ffffff",
-                         font=("Microsoft YaHei UI", 9), cursor="hand2")
+        tk.Label(top, text=title, bg=C_GOLD, fg="#17120a",
+                font=(FONT, 10, "bold")).pack(side="left", padx=10, pady=4)
+        close = tk.Label(top, text="✕", bg=C_GOLD, fg="#17120a",
+                         font=(FONT, 9), cursor="hand2")
         close.pack(side="right", padx=8)
 
-        body = tk.Label(frame, text=message, bg="#ffffff", fg="#222222",
-                        font=("Microsoft YaHei UI", 11), justify="left", anchor="w")
+        body = tk.Label(frame, text=message, bg=C_CARD, fg=C_TXT,
+                        font=(FONT, 10), justify="left", anchor="w")
         body.pack(fill="both", expand=True, padx=12, pady=8)
 
         self.active.append(win)
@@ -679,16 +802,16 @@ class _ChartLabels:
         self._draw_leaders()
         # 锚点圆点画在引线之上、胶囊之下：落在标签带内的点会被不透明胶囊自然遮住
         for it in self.items:
-            r, color = (4.5, "#ff8a00") if it["kind"] == "buy" else (3.6, "#c9a04e")
+            r, color = (4.5, "#ff9e4d") if it["kind"] == "buy" else (3.6, C_GOLD)
             mx, my = it["mx"], it["my"]
             self.cv.create_oval(mx - r, my - r, mx + r, my + r,
-                                fill=color, outline="#ffffff", width=1.6)
+                                fill=color, outline=C_CHART, width=1.6)
         for it in self.items:
             x1, y1, x2, y2 = it["box"]
             if it["kind"] == "buy":
-                fill, outline, tcolor = "#fff7ef", "#f3c89b", "#c2570a"
+                fill, outline, tcolor = "#2a2018", "#a85f22", "#ffb36b"
             else:
-                fill, outline, tcolor = "#fbf6e9", "#e3d0a0", "#8a6d2b"
+                fill, outline, tcolor = "#241f12", C_GOLD_DIM, C_GOLD_HI
             self.cv.create_rectangle(x1, y1, x2, y2, fill=fill, outline=outline)
             self.cv.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=it["text"],
                                 fill=tcolor, font=it["font"])
@@ -866,9 +989,11 @@ class GoldMonitorApp:
         self.cfg = load_config()
         self.root = tk.Tk()
         self.root.title(APP_NAME)
-        self.root.geometry("420x590")
-        self.root.minsize(420, 560)
-        self.root.configure(bg="#f5f5f7")
+        self.root.geometry("420x620")
+        self.root.minsize(420, 580)
+        self.root.configure(bg=C_BG)
+        apply_dark_style(self.root)
+        self.root.after(50, lambda: _dark_title(self.root))
 
         self.toasts = ToastManager(self.root)
         self.stop_event = threading.Event()
@@ -903,160 +1028,165 @@ class GoldMonitorApp:
 
     # ---- UI ----
     def _build_ui(self):
-        style = ttk.Style()
-        try:
-            style.theme_use("vista")
-        except tk.TclError:
-            pass
-
-        header = tk.Frame(self.root, bg="#c7000b", height=64)
+        # 顶部：深底金线，不搞大红大紫，主打一个低调搞钱
+        header = tk.Frame(self.root, bg=C_BG, height=66)
         header.pack(fill="x")
-        tk.Label(header, text="工银积存金 · 实时监控", bg="#c7000b", fg="#fff",
-                font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w", padx=16, pady=(12, 0))
+        tk.Frame(header, bg=C_GOLD, height=2).pack(fill="x")
+        tk.Label(header, text="金价盯盘小助手", bg=C_BG, fg=C_GOLD_HI,
+                 font=(FONT, 14, "bold")).pack(anchor="w", padx=18, pady=(10, 0))
         self.time_var = tk.StringVar(value="等待行情…")
-        tk.Label(header, textvariable=self.time_var, bg="#c7000b", fg="#ffd9dc",
-                font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=16, pady=(0, 10))
+        tk.Label(header, textvariable=self.time_var, bg=C_BG, fg=C_TXT_2,
+                 font=(FONT, 9)).pack(anchor="w", padx=18, pady=(0, 8))
 
-        card = tk.Frame(self.root, bg="#ffffff", highlightbackground="#e5e5ea",
+        # 价格卡
+        card = tk.Frame(self.root, bg=C_CARD, highlightbackground=C_LINE,
                         highlightthickness=1)
-        card.pack(fill="x", padx=16, pady=14)
+        card.pack(fill="x", padx=14, pady=(6, 12))
 
         self.name_var = tk.StringVar(value=SOURCES[self.cfg["source"]]["name"])
-        tk.Label(card, textvariable=self.name_var, bg="#fff", fg="#888",
-                font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=16, pady=(12, 0))
+        tk.Label(card, textvariable=self.name_var, bg=C_CARD, fg=C_TXT_2,
+                font=(FONT, 9)).pack(anchor="w", padx=16, pady=(12, 0))
 
         self.price_var = tk.StringVar(value="--")
-        self.price_label = tk.Label(card, textvariable=self.price_var, bg="#fff", fg="#222",
-                                    font=("Microsoft YaHei UI", 28, "bold"))
+        self.price_label = tk.Label(card, textvariable=self.price_var, bg=C_CARD,
+                                    fg=C_GOLD_HI, font=(FONT, 30, "bold"))
         self.price_label.pack(anchor="w", padx=14)
 
-        meta = tk.Frame(card, bg="#fff")
+        meta = tk.Frame(card, bg=C_CARD)
         meta.pack(fill="x", padx=16, pady=(0, 12))
         self.hl_var = tk.StringVar(value="最高 --")
         self.ll_var = tk.StringVar(value="最低 --")
         self.chg_var = tk.StringVar(value="")
-        tk.Label(meta, textvariable=self.hl_var, bg="#fff", fg="#888",
-                font=("Microsoft YaHei UI", 9)).pack(side="left")
-        tk.Label(meta, textvariable=self.ll_var, bg="#fff", fg="#888",
-                font=("Microsoft YaHei UI", 9)).pack(side="left", padx=14)
-        tk.Label(meta, textvariable=self.chg_var, bg="#fff", fg="#888",
-                font=("Microsoft YaHei UI", 9)).pack(side="right")
+        tk.Label(meta, textvariable=self.hl_var, bg=C_CARD, fg=C_TXT_2,
+                font=(FONT, 9)).pack(side="left")
+        tk.Label(meta, textvariable=self.ll_var, bg=C_CARD, fg=C_TXT_2,
+                font=(FONT, 9)).pack(side="left", padx=14)
+        self.chg_label = tk.Label(meta, textvariable=self.chg_var, bg=C_CARD, fg=C_TXT_2,
+                                  font=(FONT, 9, "bold"))
+        self.chg_label.pack(side="right")
 
-        # 我的持仓（按积存金赎回价估值）
-        pos = tk.Frame(self.root, bg="#fffdf7", highlightbackground="#e8d9b0",
+        # 小金库（按积存金赎回价估值）
+        pos = tk.Frame(self.root, bg=C_CARD, highlightbackground=C_GOLD_DIM,
                        highlightthickness=1)
-        pos.pack(fill="x", padx=16, pady=(0, 12))
+        pos.pack(fill="x", padx=14)
 
-        pos_head = tk.Frame(pos, bg="#fffdf7")
-        pos_head.pack(fill="x", padx=14, pady=(10, 2))
-        tk.Label(pos_head, text="我的持仓 · 工银积存金（按赎回价估值）",
-                 bg="#fffdf7", fg="#8a6d2b",
-                 font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
+        pos_head = tk.Frame(pos, bg=C_CARD)
+        pos_head.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(pos_head, text="我的小金库",
+                 bg=C_CARD, fg=C_GOLD,
+                 font=(FONT, 10, "bold")).pack(side="left")
         self.privacy_btn = tk.Button(
-            pos_head, text=("👁 隐藏" if not self.cfg.get("privacy") else "🙈 显示"),
-            font=("Microsoft YaHei UI", 8), fg="#8a6d2b", bg="#fffdf7", bd=0,
-            cursor="hand2", activebackground="#f6edd4",
+            pos_head, text=("👁 打码" if not self.cfg.get("privacy") else "🙈 亮牌"),
+            font=(FONT, 8), fg=C_GOLD, bg=C_CARD, bd=0,
+            cursor="hand2", activebackground=C_CARD_2, activeforeground=C_GOLD_HI,
             command=self._toggle_privacy)
         self.privacy_btn.pack(side="right")
-        tk.Button(pos_head, text="编辑", font=("Microsoft YaHei UI", 8),
-                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
-                  activebackground="#f6edd4", command=self._edit_position).pack(
-            side="right", padx=(0, 10))
-        tk.Button(pos_head, text="补仓测算", font=("Microsoft YaHei UI", 8),
-                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
-                  activebackground="#f6edd4",
-                  command=self._avg_down_calculator).pack(side="right", padx=(0, 10))
-        tk.Button(pos_head, text="卖出测算", font=("Microsoft YaHei UI", 8),
-                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
-                  activebackground="#f6edd4",
-                  command=self._sell_calculator).pack(side="right", padx=(0, 10))
-        tk.Button(pos_head, text="交易记录", font=("Microsoft YaHei UI", 8),
-                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
-                  activebackground="#f6edd4",
-                  command=self._open_trades).pack(side="right", padx=(0, 10))
-        tk.Button(pos_head, text="盈亏日历", font=("Microsoft YaHei UI", 8),
-                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
-                  activebackground="#f6edd4",
-                  command=self._open_pl_calendar).pack(side="right", padx=(0, 10))
-        tk.Button(pos_head, text="走势图", font=("Microsoft YaHei UI", 8),
-                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
-                  activebackground="#f6edd4",
-                  command=self._open_chart).pack(side="right", padx=(0, 10))
+
+        # 工具按钮行
+        tools = tk.Frame(pos, bg=C_CARD)
+        tools.pack(fill="x", padx=12, pady=(6, 2))
+
+        def tool_btn(parent, text, cmd):
+            return tk.Button(parent, text=text, font=(FONT, 8), fg=C_TXT,
+                             bg=C_CARD_2, bd=0, cursor="hand2", padx=6, pady=3,
+                             activebackground="#3a4050", activeforeground=C_GOLD_HI,
+                             command=cmd)
+
+        tool_btn(tools, "编辑持仓", self._edit_position).pack(side="left", padx=2)
+        tool_btn(tools, "加仓小天才", self._avg_down_calculator).pack(side="left", padx=2)
+        tool_btn(tools, "跑路计算器", self._sell_calculator).pack(side="left", padx=2)
+        tool_btn(tools, "战绩", self._open_trades).pack(side="left", padx=2)
+        tool_btn(tools, "韭历", self._open_pl_calendar).pack(side="left", padx=2)
+        tool_btn(tools, "走势图", self._open_chart).pack(side="left", padx=2)
 
         self.pos_mv_var = tk.StringVar(value="实时市值 --")
         self.pos_pl_var = tk.StringVar(value="持有收益 --")
         self.pos_pl_pct_var = tk.StringVar(value="")
         self.pos_today_var = tk.StringVar(value="今日盈亏 --")
         self.pos_info_var = tk.StringVar(value="")
+        self.roast_var = tk.StringVar(value="")
 
-        self.pos_mv_label = tk.Label(pos, textvariable=self.pos_mv_var, bg="#fffdf7",
-                                     fg="#222", font=("Microsoft YaHei UI", 17, "bold"))
-        self.pos_mv_label.pack(anchor="w", padx=14)
-        self.pos_pl_label = tk.Label(pos, textvariable=self.pos_pl_var, bg="#fffdf7",
-                                     fg="#888", font=("Microsoft YaHei UI", 10))
+        self.pos_mv_label = tk.Label(pos, textvariable=self.pos_mv_var, bg=C_CARD,
+                                     fg=C_TXT, font=(FONT, 18, "bold"))
+        self.pos_mv_label.pack(anchor="w", padx=14, pady=(8, 0))
+        self.pos_pl_label = tk.Label(pos, textvariable=self.pos_pl_var, bg=C_CARD,
+                                     fg=C_TXT_2, font=(FONT, 10))
         self.pos_pl_label.pack(anchor="w", padx=14)
 
-        row = tk.Frame(pos, bg="#fffdf7")
+        row = tk.Frame(pos, bg=C_CARD)
         row.pack(fill="x", padx=14, pady=(6, 2))
         self.pos_today_label = tk.Label(row, textvariable=self.pos_today_var,
-                                        bg="#fffdf7", fg="#888",
-                                        font=("Microsoft YaHei UI", 10, "bold"))
+                                        bg=C_CARD, fg=C_TXT_2,
+                                        font=(FONT, 10, "bold"))
         self.pos_today_label.pack(side="left")
-        tk.Label(row, textvariable=self.pos_pl_pct_var, bg="#fffdf7", fg="#888",
-                 font=("Microsoft YaHei UI", 9)).pack(side="right")
+        tk.Label(row, textvariable=self.pos_pl_pct_var, bg=C_CARD, fg=C_TXT_2,
+                 font=(FONT, 9)).pack(side="right")
 
-        tk.Label(pos, textvariable=self.pos_info_var, bg="#fffdf7", fg="#999",
-                 font=("Microsoft YaHei UI", 8), wraplength=370, justify="left").pack(
-            anchor="w", padx=14, pady=(0, 10))
+        # 动态吐槽条：今天是吃面还是加鸡腿，全看行情脸色
+        roast_bar = tk.Frame(pos, bg="#221d12")
+        roast_bar.pack(fill="x", padx=12, pady=(8, 2))
+        self.roast_label = tk.Label(roast_bar, textvariable=self.roast_var,
+                                    bg="#221d12", fg=C_GOLD_HI,
+                                    font=(FONT, 9), wraplength=356, justify="left")
+        self.roast_label.pack(anchor="w", padx=10, pady=6)
 
-        # 设置区
-        box = tk.LabelFrame(self.root, text=" 监控设置 ", bg="#f5f5f7", fg="#333",
-                            font=("Microsoft YaHei UI", 9, "bold"))
-        box.pack(fill="x", padx=16)
+        tk.Label(pos, textvariable=self.pos_info_var, bg=C_CARD, fg=C_TXT_3,
+                 font=(FONT, 8), wraplength=356, justify="left").pack(
+            anchor="w", padx=14, pady=(4, 10))
 
-        tk.Label(box, text="监控品种", bg="#f5f5f7",
-                font=("Microsoft YaHei UI", 9)).grid(row=0, column=0, sticky="w", padx=8, pady=8)
+        # 设置区（深色卡片 + 金色小标题）
+        box = tk.Frame(self.root, bg=C_CARD, highlightbackground=C_LINE,
+                       highlightthickness=1)
+        box.pack(fill="x", padx=14, pady=12)
+        tk.Label(box, text="监控设置", bg=C_CARD, fg=C_GOLD,
+                 font=(FONT, 9, "bold")).grid(row=0, column=0, columnspan=3,
+                                              sticky="w", padx=12, pady=(10, 2))
+
+        tk.Label(box, text="监控品种", bg=C_CARD, fg=C_TXT_2,
+                font=(FONT, 9)).grid(row=1, column=0, sticky="w", padx=12, pady=6)
         self.source_var = tk.StringVar(value=self.cfg["source"])
         names = {k: v["name"] for k, v in SOURCES.items()}
         self.source_combo = ttk.Combobox(box, textvariable=self.source_var,
                                          values=list(names.values()), state="readonly", width=24)
         self.name_to_key = {v: k for k, v in names.items()}
         self.source_combo.set(names[self.cfg["source"]])
-        self.source_combo.grid(row=0, column=1, columnspan=2, sticky="w", padx=4)
+        self.source_combo.grid(row=1, column=1, columnspan=2, sticky="w", padx=4)
         self.source_combo.bind("<<ComboboxSelected>>", self._on_source_change)
 
-        tk.Label(box, text="档位间隔(元)", bg="#f5f5f7",
-                font=("Microsoft YaHei UI", 9)).grid(row=1, column=0, sticky="w", padx=8, pady=8)
+        tk.Label(box, text="档位间隔(元)", bg=C_CARD, fg=C_TXT_2,
+                font=(FONT, 9)).grid(row=2, column=0, sticky="w", padx=12, pady=6)
         self.step_var = tk.StringVar(value=str(self.cfg["step"]))
         ttk.Combobox(box, textvariable=self.step_var, width=8, state="readonly",
-                     values=["1", "2", "5", "10", "20", "50"]).grid(row=1, column=1, sticky="w")
+                     values=["1", "2", "5", "10", "20", "50"]).grid(row=2, column=1, sticky="w")
 
-        tk.Label(box, text="刷新间隔(秒)", bg="#f5f5f7",
-                font=("Microsoft YaHei UI", 9)).grid(row=2, column=0, sticky="w", padx=8, pady=8)
+        tk.Label(box, text="刷新间隔(秒)", bg=C_CARD, fg=C_TXT_2,
+                font=(FONT, 9)).grid(row=3, column=0, sticky="w", padx=12, pady=6)
         self.interval_var = tk.StringVar(value=str(self.cfg["interval"]))
         ttk.Spinbox(box, from_=5, to=300, increment=5, width=10,
-                    textvariable=self.interval_var).grid(row=2, column=1, sticky="w")
+                    textvariable=self.interval_var).grid(row=3, column=1, sticky="w")
 
         self.sound_var = tk.BooleanVar(value=self.cfg["sound"])
-        ttk.Checkbutton(box, text="弹窗时播放提示音", variable=self.sound_var).grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 8))
+        dark_checkbutton(box, "破位时播放提示音", self.sound_var,
+                         bg=C_CARD).grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 2))
 
         self.autostart_var = tk.BooleanVar(value=self.cfg["autostart"])
-        ttk.Checkbutton(box, text="开机自动启动", variable=self.autostart_var,
-                        command=self._on_autostart).grid(
-            row=4, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 8))
+        dark_checkbutton(box, "开机自动启动（一起床就看盘）", self.autostart_var,
+                         bg=C_CARD, command=self._on_autostart).grid(
+            row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 10))
 
         # 按钮
-        btns = tk.Frame(self.root, bg="#f5f5f7")
-        btns.pack(fill="x", padx=16, pady=12)
-        ttk.Button(btns, text="立即刷新", command=self._poll_once).pack(side="left")
+        btns = tk.Frame(self.root, bg=C_BG)
+        btns.pack(fill="x", padx=14)
+        ttk.Button(btns, text="立即刷新", style="Gold.TButton",
+                   command=self._poll_once).pack(side="left")
         ttk.Button(btns, text="测试弹窗", command=self._test_alert).pack(side="left", padx=8)
-        ttk.Button(btns, text="最小化到托盘", command=self.hide_window).pack(side="right")
+        ttk.Button(btns, text="暗中观察", command=self.hide_window).pack(side="right")
 
         self.status_var = tk.StringVar(value="")
-        tk.Label(self.root, textvariable=self.status_var, bg="#f5f5f7", fg="#999",
-                font=("Microsoft YaHei UI", 8), wraplength=380, justify="left").pack(
-            anchor="w", padx=18)
+        tk.Label(self.root, textvariable=self.status_var, bg=C_BG, fg=C_TXT_3,
+                font=(FONT, 8), wraplength=380, justify="left").pack(
+            anchor="w", padx=18, pady=8)
 
     def _on_source_change(self, _=None):
         key = self.name_to_key.get(self.source_combo.get())
@@ -1203,25 +1333,33 @@ class GoldMonitorApp:
     def _edit_position(self):
         win = tk.Toplevel(self.root)
         win.title("编辑我的持仓")
-        win.geometry("320x200")
-        win.resizable(False, False)
-        win.configure(bg="#f5f5f7")
+        win.after(60, lambda w=win: _dark_title(w))
+        win.geometry("460x268")
+        win.minsize(420, 240)
+        win.resizable(True, True)
+        win.configure(bg=C_BG)
         win.transient(self.root)
         win.grab_set()
+        win.grid_columnconfigure(1, weight=1)
 
         grams_var = tk.StringVar(value=f"{self.cfg.get('hold_grams') or 0:g}")
         cost_var = tk.StringVar(value=f"{self.cfg.get('hold_cost') or 0:g}")
 
         def add_row(r, label, var, hint=""):
-            tk.Label(win, text=label, bg="#f5f5f7",
-                     font=("Microsoft YaHei UI", 9)).grid(row=r, column=0, sticky="w",
-                                                          padx=14, pady=(14, 0))
-            ttk.Entry(win, textvariable=var, width=16).grid(row=r, column=1,
-                                                            padx=8, pady=(14, 0))
+            tk.Label(win, text=label, bg=C_BG, fg=C_TXT,
+                     font=(FONT, 9)).grid(row=r, column=0, sticky="w",
+                                          padx=14, pady=(14, 0))
+            ttk.Entry(win, textvariable=var, width=16).grid(
+                row=r, column=1, sticky="ew", padx=(8, 14), pady=(14, 0))
             if hint:
-                tk.Label(win, text=hint, bg="#f5f5f7", fg="#999",
-                         font=("Microsoft YaHei UI", 8)).grid(
-                    row=r + 1, column=1, sticky="w", padx=8)
+                hlab = tk.Label(win, text=hint, bg=C_BG, fg=C_TXT_2,
+                                font=(FONT, 8), wraplength=410, justify="left",
+                                anchor="w")
+                hlab.grid(row=r + 1, column=0, columnspan=2, sticky="ew",
+                          padx=14, pady=(5, 0))
+                win.bind("<Configure>", lambda e, w=hlab:
+                         w.configure(wraplength=max(120, e.width - 36)),
+                         add="+")
 
         add_row(0, "持有克数(克)", grams_var)
         add_row(2, "累计投入成本(元)", cost_var,
@@ -1238,18 +1376,20 @@ class GoldMonitorApp:
             except ValueError:
                 messagebox.showwarning("编辑持仓", "请填写有效的数字。", parent=win)
 
-        btns = tk.Frame(win, bg="#f5f5f7")
+        btns = tk.Frame(win, bg=C_BG)
         btns.grid(row=4, column=0, columnspan=2, pady=18)
-        ttk.Button(btns, text="保存", command=on_save).pack(side="left", padx=8)
+        ttk.Button(btns, text="保存", style="Gold.TButton",
+                   command=on_save).pack(side="left", padx=8)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side="left")
 
     # ---- 补仓测算 ----
     def _avg_down_calculator(self):
         win = tk.Toplevel(self.root)
-        win.title("补仓回本测算")
+        win.title("加仓小天才 · 回本测算")
+        win.after(60, lambda w=win: _dark_title(w))
         win.geometry("430x486")
         win.resizable(False, False)
-        win.configure(bg="#f5f5f7")
+        win.configure(bg=C_BG)
         win.transient(self.root)
         win.grab_set()
 
@@ -1258,37 +1398,37 @@ class GoldMonitorApp:
         buy_px = self._latest_data.get("jicun_active")
         sell_px = self._latest_data.get("jicun_sell")
 
-        tk.Label(win, text="假设按当前实时价格立即补仓", bg="#f5f5f7", fg="#333",
-                 font=("Microsoft YaHei UI", 11, "bold")).grid(
+        tk.Label(win, text="加仓小天才：假设现在立刻补一笔", bg=C_BG, fg=C_GOLD_HI,
+                 font=(FONT, 11, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(14, 4))
 
-        in_box = tk.Frame(win, bg="#f5f5f7")
+        in_box = tk.Frame(win, bg=C_BG)
         in_box.grid(row=1, column=0, columnspan=2, sticky="we", padx=18)
-        tk.Label(in_box, text="补仓金额(元)", bg="#f5f5f7",
-                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Label(in_box, text="补仓金额(元)", bg=C_BG, fg=C_TXT_2,
+                 font=(FONT, 9)).pack(side="left")
         amt_var = tk.StringVar(value="5000")
         ttk.Entry(in_box, textvariable=amt_var, width=12).pack(side="left", padx=8)
-        tk.Label(in_box, text="买入价(元/克)", bg="#f5f5f7",
-                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(10, 0))
+        tk.Label(in_box, text="买入价(元/克)", bg=C_BG, fg=C_TXT_2,
+                 font=(FONT, 9)).pack(side="left", padx=(10, 0))
         px_var = tk.StringVar(value=f"{buy_px:g}" if buy_px else "")
         ttk.Entry(in_box, textvariable=px_var, width=9).pack(side="left", padx=8)
 
-        result = tk.Frame(win, bg="#ffffff", highlightbackground="#e5e5ea",
+        result = tk.Frame(win, bg=C_CARD, highlightbackground=C_LINE,
                           highlightthickness=1)
         result.grid(row=2, column=0, columnspan=2, sticky="we", padx=18, pady=12)
         result.columnconfigure(0, weight=1)
         rvar = tk.StringVar(value="")
-        tk.Label(result, textvariable=rvar, bg="#fff", fg="#222", justify="left",
-                 font=("Microsoft YaHei UI", 10), wraplength=380, anchor="w").grid(
+        tk.Label(result, textvariable=rvar, bg=C_CARD, fg=C_TXT, justify="left",
+                 font=(FONT, 10), wraplength=380, anchor="w").grid(
             row=0, column=0, sticky="w", padx=14, pady=12)
 
         tk.Label(win, text="※ 回本=赎回价回到摊薄均价；金价未来走势无法预测，\n"
                            "   下方月数为“假设匀速月涨幅”下的理论参考，不构成投资建议。",
-                 bg="#f5f5f7", fg="#999", justify="left",
-                 font=("Microsoft YaHei UI", 8)).grid(
+                 bg=C_BG, fg=C_TXT_3, justify="left",
+                 font=(FONT, 8)).grid(
             row=3, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 6))
 
-        ttk.Button(win, text="开始测算",
+        ttk.Button(win, text="开始测算", style="Gold.TButton",
                    command=lambda: calc()).grid(row=4, column=0, pady=8)
         ttk.Button(win, text="关闭", command=win.destroy).grid(row=4, column=1)
 
@@ -1346,10 +1486,11 @@ class GoldMonitorApp:
     # ---- 卖出（赎回）手续费测算 ----
     def _sell_calculator(self):
         win = tk.Toplevel(self.root)
-        win.title("卖出测算 · 赎回手续费")
+        win.title("跑路计算器 · 赎回手续费")
+        win.after(60, lambda w=win: _dark_title(w))
         win.geometry("430x470")
         win.resizable(False, False)
-        win.configure(bg="#f5f5f7")
+        win.configure(bg=C_BG)
         win.transient(self.root)
         win.grab_set()
 
@@ -1358,38 +1499,38 @@ class GoldMonitorApp:
         sell_px = self._latest_data.get("jicun_sell")
         hidden = bool(self.cfg.get("privacy"))
 
-        tk.Label(win, text="假设按当前实时赎回价立即卖出", bg="#f5f5f7", fg="#333",
-                 font=("Microsoft YaHei UI", 11, "bold")).grid(
+        tk.Label(win, text="跑路计算器：假设现在立刻落袋为安", bg=C_BG, fg=C_GOLD_HI,
+                 font=(FONT, 11, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(14, 4))
 
-        in_box = tk.Frame(win, bg="#f5f5f7")
+        in_box = tk.Frame(win, bg=C_BG)
         in_box.grid(row=1, column=0, columnspan=2, sticky="we", padx=18)
-        tk.Label(in_box, text="卖出克数(克)", bg="#f5f5f7",
-                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Label(in_box, text="卖出克数(克)", bg=C_BG, fg=C_TXT_2,
+                 font=(FONT, 9)).pack(side="left")
         g_var = tk.StringVar(value=(f"{grams0:g}" if grams0 else ""))
         ttk.Entry(in_box, textvariable=g_var, width=11).pack(side="left", padx=8)
-        tk.Label(in_box, text="赎回价(元/克)", bg="#f5f5f7",
-                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(10, 0))
+        tk.Label(in_box, text="赎回价(元/克)", bg=C_BG, fg=C_TXT_2,
+                 font=(FONT, 9)).pack(side="left", padx=(10, 0))
         px_var = tk.StringVar(value=f"{sell_px:g}" if sell_px else "")
         ttk.Entry(in_box, textvariable=px_var, width=9).pack(side="left", padx=8)
 
-        result = tk.Frame(win, bg="#ffffff", highlightbackground="#e5e5ea",
+        result = tk.Frame(win, bg=C_CARD, highlightbackground=C_LINE,
                           highlightthickness=1)
         result.grid(row=2, column=0, columnspan=2, sticky="we", padx=18, pady=12)
         result.columnconfigure(0, weight=1)
         rvar = tk.StringVar(value="")
-        tk.Label(result, textvariable=rvar, bg="#fff", fg="#222", justify="left",
-                 font=("Microsoft YaHei UI", 10), wraplength=380, anchor="w").grid(
+        tk.Label(result, textvariable=rvar, bg=C_CARD, fg=C_TXT, justify="left",
+                 font=(FONT, 10), wraplength=380, anchor="w").grid(
             row=0, column=0, sticky="w", padx=14, pady=12)
 
         tk.Label(win, text="※ 赎回手续费=赎回金额×0.5%（工行个人积存金标准），\n"
                            "   按赎回当日实时赎回价成交，资金一般 T+5 个工作日到账；\n"
                            "   兑换实物金条不按此收费。实际以工行办理时为准。",
-                 bg="#f5f5f7", fg="#999", justify="left",
-                 font=("Microsoft YaHei UI", 8)).grid(
+                 bg=C_BG, fg=C_TXT_3, justify="left",
+                 font=(FONT, 8)).grid(
             row=3, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 6))
 
-        ttk.Button(win, text="开始测算",
+        ttk.Button(win, text="开始测算", style="Gold.TButton",
                    command=lambda: calc()).grid(row=4, column=0, pady=8)
         ttk.Button(win, text="关闭", command=win.destroy).grid(row=4, column=1)
 
@@ -1446,22 +1587,23 @@ class GoldMonitorApp:
             self._trades_win.focus_force()
             return
         win = tk.Toplevel(self.root)
-        win.title("补仓记录 · 逐笔盈亏")
+        win.title("我的战绩 · 逐笔补仓盈亏")
+        win.after(60, lambda w=win: _dark_title(w))
         win.geometry("600x540")
         win.minsize(560, 460)
-        win.configure(bg="#f5f5f7")
+        win.configure(bg=C_BG)
         win.transient(self.root)
 
-        tk.Label(win, text="补仓记录 · 按实时赎回价计算浮动盈亏", bg="#f5f5f7", fg="#333",
-                font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=16, pady=(12, 2))
+        tk.Label(win, text="我的战绩 · 按实时赎回价计算浮动盈亏", bg=C_BG, fg=C_GOLD_HI,
+                font=(FONT, 11, "bold")).pack(anchor="w", padx=16, pady=(12, 2))
         self._trades_tip_var = tk.StringVar(value="")
-        tk.Label(win, textvariable=self._trades_tip_var, bg="#f5f5f7", fg="#999",
-                font=("Microsoft YaHei UI", 8), justify="left").pack(anchor="w", padx=16)
+        tk.Label(win, textvariable=self._trades_tip_var, bg=C_BG, fg=C_TXT_2,
+                font=(FONT, 8), justify="left").pack(anchor="w", padx=16)
 
         cols = ("dt", "amount", "grams", "price", "pl", "pct")
         headers = ("买入时间", "金额(元)", "克数(克)", "买入价", "浮动盈亏(元)", "涨跌幅")
         widths = (130, 80, 85, 75, 105, 75)
-        frame = tk.Frame(win, bg="#fff", highlightbackground="#e5e5ea", highlightthickness=1)
+        frame = tk.Frame(win, bg=C_CARD, highlightbackground=C_LINE, highlightthickness=1)
         frame.pack(fill="both", expand=True, padx=16, pady=10)
         tree = ttk.Treeview(frame, columns=cols, show="headings", height=11, selectmode="browse")
         for c, h, w in zip(cols, headers, widths):
@@ -1471,15 +1613,16 @@ class GoldMonitorApp:
         tree.configure(yscrollcommand=vsb.set)
         tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-        tree.tag_configure("plus", foreground="#d93025")
-        tree.tag_configure("minus", foreground="#00a650")
-        tree.tag_configure("base", background="#f6f1e3")
-        tree.tag_configure("total", background="#eef3ff")
+        tree.tag_configure("plus", foreground=C_UP)
+        tree.tag_configure("minus", foreground=C_DOWN)
+        tree.tag_configure("base", background="#241f12")
+        tree.tag_configure("total", background="#20242f")
         self._trades_tree = tree
 
-        btns = tk.Frame(win, bg="#f5f5f7")
+        btns = tk.Frame(win, bg=C_BG)
         btns.pack(fill="x", padx=16, pady=(0, 12))
-        ttk.Button(btns, text="添加补仓", command=self._add_trade).pack(side="left")
+        ttk.Button(btns, text="记一笔补仓", style="Gold.TButton",
+                   command=self._add_trade).pack(side="left")
         ttk.Button(btns, text="删除选中", command=self._delete_trade).pack(side="left", padx=8)
         ttk.Button(btns, text="关闭", command=self._close_trades).pack(side="right")
 
@@ -1593,57 +1736,60 @@ class GoldMonitorApp:
             self._pl_win.focus_force()
             return
         win = tk.Toplevel(self.root)
-        win.title("每日盈亏 · 日历")
+        win.title("韭历 · 每日盈亏")
+        win.after(60, lambda w=win: _dark_title(w))
         win.geometry("430x560")
         win.minsize(400, 520)
-        win.configure(bg="#f5f5f7")
+        win.configure(bg=C_BG)
         win.transient(self.root)
 
         # 顶部：月份切换
-        head = tk.Frame(win, bg="#f5f5f7")
+        head = tk.Frame(win, bg=C_BG)
         head.pack(fill="x", padx=16, pady=(14, 2))
-        self._pl_prev_btn = tk.Button(head, text="‹", font=("Microsoft YaHei UI", 14, "bold"),
-                                      fg="#8a6d2b", bg="#f5f5f7", bd=0, cursor="hand2",
-                                      activebackground="#eee", command=self._pl_prev_month)
+        self._pl_prev_btn = tk.Button(head, text="‹", font=(FONT, 14, "bold"),
+                                      fg=C_GOLD, bg=C_BG, bd=0, cursor="hand2",
+                                      activebackground=C_CARD_2, activeforeground=C_GOLD_HI,
+                                      command=self._pl_prev_month)
         self._pl_prev_btn.pack(side="left")
         self._pl_title_var = tk.StringVar()
-        tk.Label(head, textvariable=self._pl_title_var, bg="#f5f5f7", fg="#333",
-                font=("Microsoft YaHei UI", 13, "bold")).pack(side="left", padx=14)
-        self._pl_next_btn = tk.Button(head, text="›", font=("Microsoft YaHei UI", 14, "bold"),
-                                      fg="#8a6d2b", bg="#f5f5f7", bd=0, cursor="hand2",
-                                      activebackground="#eee", command=self._pl_next_month)
+        tk.Label(head, textvariable=self._pl_title_var, bg=C_BG, fg=C_TXT,
+                font=(FONT, 13, "bold")).pack(side="left", padx=14)
+        self._pl_next_btn = tk.Button(head, text="›", font=(FONT, 14, "bold"),
+                                      fg=C_GOLD, bg=C_BG, bd=0, cursor="hand2",
+                                      activebackground=C_CARD_2, activeforeground=C_GOLD_HI,
+                                      command=self._pl_next_month)
         self._pl_next_btn.pack(side="left")
 
         # 本月合计
         self._pl_month_var = tk.StringVar()
         self._pl_month_label = tk.Label(win, textvariable=self._pl_month_var,
-                                        bg="#f5f5f7", fg="#666",
-                                        font=("Microsoft YaHei UI", 10, "bold"))
+                                        bg=C_BG, fg=C_TXT_2,
+                                        font=(FONT, 10, "bold"))
         self._pl_month_label.pack(anchor="w", padx=18, pady=(2, 6))
 
         # 星期表头
         weekday_names = ["一", "二", "三", "四", "五", "六", "日"]
-        wd = tk.Frame(win, bg="#f5f5f7")
+        wd = tk.Frame(win, bg=C_BG)
         wd.pack(fill="x", padx=14)
         for i, name in enumerate(weekday_names):
-            tk.Label(wd, text=name, bg="#f5f5f7", fg="#999",
-                    font=("Microsoft YaHei UI", 8)).grid(row=0, column=i, sticky="nsew",
+            tk.Label(wd, text=name, bg=C_BG, fg=C_TXT_3,
+                    font=(FONT, 8)).grid(row=0, column=i, sticky="nsew",
                                                         padx=2, pady=2)
             wd.grid_columnconfigure(i, weight=1, uniform="pl")
 
         # 日期网格容器（每月重建）
-        self._pl_grid = tk.Frame(win, bg="#f5f5f7")
+        self._pl_grid = tk.Frame(win, bg=C_BG)
         self._pl_grid.pack(fill="both", expand=True, padx=14, pady=(0, 6))
         for i in range(7):
             self._pl_grid.grid_columnconfigure(i, weight=1, uniform="pl")
 
         # 选中日明细
-        detail_box = tk.Frame(win, bg="#fff", highlightbackground="#e5e5ea",
+        detail_box = tk.Frame(win, bg=C_CARD, highlightbackground=C_LINE,
                               highlightthickness=1)
         detail_box.pack(fill="x", padx=14, pady=(2, 4))
         self._pl_detail_var = tk.StringVar()
-        tk.Label(detail_box, textvariable=self._pl_detail_var, bg="#fff", fg="#333",
-                font=("Microsoft YaHei UI", 9), justify="left", anchor="w",
+        tk.Label(detail_box, textvariable=self._pl_detail_var, bg=C_CARD, fg=C_TXT,
+                font=(FONT, 9), justify="left", anchor="w",
                 wraplength=380).pack(anchor="w", padx=10, pady=8)
 
         tk.Label(win, text="每日盈亏与支付宝同口径：按每晚 22:30 黄金T+D夜盘收盘价结算"
@@ -1651,7 +1797,7 @@ class GoldMonitorApp:
                           "更早日期用黄金9999日K近似并标“估”）；当日盘中按实时赎回价。"
                           "每日盈亏=(昨日存量+当日买入)×(今收−昨收)，当日买入即计入、"
                           "统一按上一交易日日结价起算；买入价只影响成本，不参与当日盈亏。",
-                bg="#f5f5f7", fg="#aaa", font=("Microsoft YaHei UI", 7),
+                bg=C_BG, fg=C_TXT_3, font=(FONT, 7),
                 justify="left", wraplength=390).pack(anchor="w", padx=16, pady=(0, 10))
 
         # 默认展示当月（当月无交易日则定位到最近一个有数据的月份）
@@ -1698,8 +1844,8 @@ class GoldMonitorApp:
 
         if rows is None:
             msg = "夜盘日结价加载中…" if not fetch_error else f"日结价获取失败：{fetch_error}\n将随下次行情刷新自动重试"
-            tk.Label(self._pl_grid, text=msg, bg="#f5f5f7", fg="#999",
-                    font=("Microsoft YaHei UI", 10), justify="center").grid(
+            tk.Label(self._pl_grid, text=msg, bg=C_BG, fg=C_TXT_2,
+                    font=(FONT, 10), justify="center").grid(
                 row=0, column=0, columnspan=7, pady=40)
             self._pl_month_var.set("本月盈亏 …")
             self._pl_detail_var.set("正在获取黄金T+D近10日夜盘日结价…")
@@ -1714,13 +1860,13 @@ class GoldMonitorApp:
             self._pl_month_var.set(f"本月（{n_trade} 个交易日）盈亏 ****")
         elif n_trade:
             sgn = "+" if month_sum >= 0 else ""
-            color = "#d93025" if month_sum >= 0 else "#00a650"
+            color = C_UP if month_sum >= 0 else C_DOWN
             self._pl_month_var.set(
                 f"本月（{n_trade} 个交易日）盈亏  {sgn}{month_sum:,.2f} 元")
             self._pl_month_label.configure(fg=color)
         else:
             self._pl_month_var.set("本月暂无交易日")
-            self._pl_month_label.configure(fg="#999")
+            self._pl_month_label.configure(fg=C_TXT_2)
 
         # 下个月是否有交易日数据：有则允许前进；封顶当前月
         nxt = (cur.replace(day=28) + timedelta(days=10)).replace(day=1)
@@ -1744,41 +1890,41 @@ class GoldMonitorApp:
         self._render_pl_detail(rows, hidden, today_str)
 
     def _pl_day_cell(self, parent, ds, daynum, info, in_month, hidden, is_today, selected):
-        bg = "#fff" if in_month else "#fafafa"
-        fg_day = "#bbb" if not in_month else "#555"
+        bg = C_CARD if in_month else C_CHART
+        fg_day = C_TXT_3 if not in_month else C_TXT_2
         if info is not None and in_month:
             if info["pl"] > 0.005:
-                pl_color = "#d93025"
+                pl_color = C_UP
             elif info["pl"] < -0.005:
-                pl_color = "#00a650"
+                pl_color = C_DOWN
             else:
-                pl_color = "#999"
+                pl_color = C_TXT_2
         else:
-            pl_color = "#ccc"
+            pl_color = C_TXT_3
         if selected and in_month:
-            bg = "#f6edd4"
+            bg = "#2a2415"
         cell = tk.Frame(parent, bg=bg, highlightbackground=(
-                        "#c9a04e" if selected else "#ececec"),
+                        C_GOLD if selected else C_LINE),
                         highlightthickness=(1.5 if selected else 1), cursor="hand2")
         head_txt = str(daynum) + (" 今" if is_today and in_month else "")
         head = tk.Frame(cell, bg=bg)
         head.pack(fill="x", padx=5, pady=(3, 0))
-        tk.Label(head, text=head_txt, bg=bg, fg=fg_day,
-                font=("Microsoft YaHei UI", 8, "bold" if is_today else "normal")).pack(side="left")
+        tk.Label(head, text=head_txt, bg=bg, fg=(C_GOLD_HI if is_today and in_month else fg_day),
+                font=(FONT, 8, "bold" if is_today else "normal")).pack(side="left")
         if info is not None and info.get("est"):
-            tk.Label(head, text="估", bg=bg, fg="#a98a2e",
-                    font=("Microsoft YaHei UI", 7, "bold")).pack(side="right")
+            tk.Label(head, text="估", bg=bg, fg=C_GOLD_DIM,
+                    font=(FONT, 7, "bold")).pack(side="right")
         if in_month:
             if info is None:
-                tk.Label(cell, text="—", bg=bg, fg="#ddd",
-                        font=("Microsoft YaHei UI", 8)).pack(anchor="e", padx=5, pady=(0, 3))
+                tk.Label(cell, text="—", bg=bg, fg=C_TXT_3,
+                        font=(FONT, 8)).pack(anchor="e", padx=5, pady=(0, 3))
             elif hidden:
                 tk.Label(cell, text="****", bg=bg, fg=pl_color,
-                        font=("Microsoft YaHei UI", 8, "bold")).pack(
+                        font=(FONT, 8, "bold")).pack(
                     anchor="e", padx=5, pady=(0, 3))
             else:
                 tk.Label(cell, text=f"{info['pl']:+,.0f}", bg=bg, fg=pl_color,
-                        font=("Microsoft YaHei UI", 9, "bold")).pack(
+                        font=(FONT, 9, "bold")).pack(
                     anchor="e", padx=5, pady=(0, 3))
             for w in cell.winfo_children():
                 w.bind("<Button-1>", lambda e, d=ds: self._pl_select_day(d))
@@ -1840,16 +1986,17 @@ class GoldMonitorApp:
             self._chart_win.focus_force()
             return
         win = tk.Toplevel(self.root)
-        win.title("积存金走势 · 买入点位")
+        win.title("金价走势 · 买点地图")
+        win.after(60, lambda w=win: _dark_title(w))
         win.geometry("900x540")
         win.minsize(780, 480)
-        win.configure(bg="#f5f5f7")
+        win.configure(bg=C_BG)
         win.transient(self.root)
 
-        top = tk.Frame(win, bg="#f5f5f7")
+        top = tk.Frame(win, bg=C_BG)
         top.pack(fill="x", padx=14, pady=(12, 4))
-        tk.Label(top, text="模式", bg="#f5f5f7",
-                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Label(top, text="模式", bg=C_BG, fg=C_TXT_2,
+                 font=(FONT, 9)).pack(side="left")
         self._chart_mode_var = tk.StringVar(value="今日分时（在线）")
         self._chart_mode_combo = ttk.Combobox(
             top, textvariable=self._chart_mode_var, width=16, state="readonly",
@@ -1857,8 +2004,8 @@ class GoldMonitorApp:
         self._chart_mode_combo.pack(side="left", padx=(6, 14))
         self._chart_mode_combo.bind("<<ComboboxSelected>>",
                                     lambda _=None: self._on_chart_mode())
-        tk.Label(top, text="交易日", bg="#f5f5f7",
-                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Label(top, text="交易日", bg=C_BG, fg=C_TXT_2,
+                 font=(FONT, 9)).pack(side="left")
         days = sorted(self._hist.keys(), reverse=True)
         today = self._trade_date or (days[0] if days else "")
         if today and today not in days:
@@ -1870,26 +2017,28 @@ class GoldMonitorApp:
         self._chart_combo.pack(side="left", padx=(6, 14))
         self._chart_combo.bind("<<ComboboxSelected>>", lambda _=None: self._draw_chart())
         self._chart_cost_var = tk.BooleanVar(value=True)
-        self._chart_cost_cb = ttk.Checkbutton(
-            top, text="显示持仓成本线", variable=self._chart_cost_var,
+        self._chart_cost_cb = dark_checkbutton(
+            top, "显示持仓成本线", self._chart_cost_var,
             command=self._draw_chart)
         self._chart_cost_cb.pack(side="left")
         self._chart_refresh_btn = tk.Button(
-            top, text="刷新", font=("Microsoft YaHei UI", 8),
-            relief="groove", bg="#f5f5f7", padx=6, command=self._reload_chart)
+            top, text="重新取数", font=(FONT, 8),
+            relief="flat", bg=C_CARD_2, fg=C_TXT, bd=0, padx=8, pady=3,
+            activebackground="#3a4050", activeforeground=C_GOLD_HI,
+            command=self._reload_chart)
         self._chart_refresh_btn.pack(side="right")
 
-        chart_frame = tk.Frame(win, bg="#ffffff",
-                               highlightbackground="#e5e5ea", highlightthickness=1)
+        chart_frame = tk.Frame(win, bg=C_CHART,
+                               highlightbackground=C_LINE, highlightthickness=1)
         chart_frame.pack(fill="both", expand=True, padx=14, pady=(4, 6))
-        self._chart_canvas = tk.Canvas(chart_frame, bg="#ffffff",
+        self._chart_canvas = tk.Canvas(chart_frame, bg=C_CHART,
                                        highlightthickness=0, height=400)
         self._chart_canvas.pack(fill="both", expand=True)
         self._chart_canvas.bind("<Configure>", lambda _=None: self._draw_chart())
 
         self._chart_tip_var = tk.StringVar(value="")
-        tk.Label(win, textvariable=self._chart_tip_var, bg="#f5f5f7", fg="#999",
-                 font=("Microsoft YaHei UI", 8), justify="left",
+        tk.Label(win, textvariable=self._chart_tip_var, bg=C_BG, fg=C_TXT_3,
+                 font=(FONT, 8), justify="left",
                  wraplength=760).pack(anchor="w", padx=16, pady=(0, 10))
 
         self._chart_win = win
@@ -1917,10 +2066,10 @@ class GoldMonitorApp:
         return int(h) * 60 + int(m)
 
     @staticmethod
-    def _dot(cv, x, y, r=4.5, color="#ff8a00"):
-        """买点 / 端点圆点：实心 + 白描边。"""
+    def _dot(cv, x, y, r=4.5, color="#ff9e4d"):
+        """买点 / 端点圆点：实心 + 画布色描边。"""
         cv.create_oval(x - r, y - r, x + r, y + r,
-                       fill=color, outline="#ffffff", width=1.6)
+                       fill=color, outline=C_CHART, width=1.6)
 
     # ---- 走势图（三模式：在线分时 / 在线历史日K / 本地采集分时） ----
     CHART_MODES = {"今日分时（在线）": "today",
@@ -1999,9 +2148,9 @@ class GoldMonitorApp:
         """网格底 + 居中提示（加载中/失败/无数据）。"""
         for i in range(5):
             y = T + (B - T) * i / 4
-            cv.create_line(L, y, R, y, fill="#f2f2f2")
-        cv.create_text((L + R) / 2, (T + B) / 2, text=text, fill="#999",
-                       font=("Microsoft YaHei UI", 10), justify="center")
+            cv.create_line(L, y, R, y, fill="#22242c")
+        cv.create_text((L + R) / 2, (T + B) / 2, text=text, fill=C_TXT_2,
+                       font=(FONT, 10), justify="center")
         if tip is not None:
             self._chart_tip_var.set(tip)
 
@@ -2009,18 +2158,18 @@ class GoldMonitorApp:
                           skip_y=None):
         """纵网格 + 横网格 + 右轴价格刻度。skip_y 处的刻度留给最新价价签。"""
         for x, lab in (vlines or []):
-            cv.create_line(x, T, x, B, fill="#f3ede0")
-            cv.create_text(x, B + 10, text=lab, fill="#a8a8a8",
-                           font=("Microsoft YaHei UI", 8))
+            cv.create_line(x, T, x, B, fill="#262830")
+            cv.create_text(x, B + 10, text=lab, fill=C_TXT_3,
+                           font=(FONT, 8))
         for i in range(5):
             y = T + (B - T) * i / 4
-            cv.create_line(L, y, R, y, fill="#f0f0f2")
+            cv.create_line(L, y, R, y, fill="#22242c")
             p = y_max - (y_max - y_min) * i / 4
             if skip_y is not None and abs(y - skip_y) < 12:
                 continue
-            cv.create_text(R + 10, y, text=f"{p:.2f}", fill="#b0b0b0",
-                           font=("Microsoft YaHei UI", 8), anchor="w")
-        cv.create_line(R, T, R, B, fill="#e8e8ec")
+            cv.create_text(R + 10, y, text=f"{p:.2f}", fill=C_TXT_3,
+                           font=(FONT, 8), anchor="w")
+        cv.create_line(R, T, R, B, fill=C_LINE)
 
     def _avg_cost(self):
         """当前持仓加权平均成本（元/克）；无持仓返回 None。"""
@@ -2037,13 +2186,13 @@ class GoldMonitorApp:
     def _avg_cost_line(self, cv, L, R, y_of, avg):
         """单条持仓平均成本虚线（克制呈现，替代原先每笔一条）。"""
         yc = y_of(avg)
-        cv.create_line(L, yc, R, yc, fill="#f0a35c", dash=(5, 4), width=1)
+        cv.create_line(L, yc, R, yc, fill="#e8924a", dash=(5, 4), width=1)
         txt = f"持仓成本 {avg:.2f}"
         tid = cv.create_text(L + 6, yc - 6, anchor="sw", text=txt,
-                             fill="#c2570a", font=("Microsoft YaHei UI", 8))
+                             fill="#ffb36b", font=(FONT, 8))
         x1, y1, x2, y2 = cv.bbox(tid)
         rid = cv.create_rectangle(x1 - 5, y1 - 2, x2 + 5, y2 + 2,
-                                  fill="#fffaf4", outline="#f3c89b")
+                                  fill="#2a2018", outline="#a85f22")
         cv.tag_lower(rid, tid)
         return (x1 - 5, y1 - 2, x2 + 5, y2 + 2)
 
@@ -2054,8 +2203,9 @@ class GoldMonitorApp:
             cv.create_line(x + 5, y, R - 2, y, fill=color, width=1)
         tag_w = 52
         _round_rect(cv, R + 2, y - 9, R + tag_w, y + 9, 5, fill=color, outline="")
+        tag_fg = "#17120a" if color in (C_GOLD, "#c9a04e") else "#ffffff"
         cv.create_text(R + tag_w / 2 - 2, y, text=f"{price:.2f}",
-                       fill="#ffffff", font=("Microsoft YaHei UI", 8, "bold"))
+                       fill=tag_fg, font=(FONT, 8, "bold"))
 
     # ---------- 在线：黄金9999 当日分时 ----------
     def _draw_em_trend(self, cv, L, R, T, B):
@@ -2140,8 +2290,8 @@ class GoldMonitorApp:
         if base:
             chg = last_p - base
             chg_txt = f"   较昨收 {'+' if chg >= 0 else ''}{chg:.2f}（{(last_p / base - 1) * 100:+.2f}%）"
-        cv.create_text(L, 12, anchor="nw", fill="#8a6d2b",
-                       font=("Microsoft YaHei UI", 10, "bold"),
+        cv.create_text(L, 12, anchor="nw", fill=C_GOLD,
+                       font=(FONT, 10, "bold"),
                        text=f"黄金9999（Au99.99）在线分时  {date}"
                             f"    最新 {last_p:.2f}   高 {pmax:.2f}   低 {pmin:.2f}{chg_txt}")
 
@@ -2150,15 +2300,15 @@ class GoldMonitorApp:
         for i, (_, p) in enumerate(pts):
             coords.extend([x_of(i), y_of(p)])
         cv.create_polygon(coords + [coords[-2], B, coords[0], B],
-                          fill="#f4ead1", outline="")
-        cv.create_line(coords, fill="#c9a04e", width=1.8)
+                          fill="#241f14", outline="")
+        cv.create_line(coords, fill=C_GOLD, width=1.8)
 
         # 基准线画在填充之上，保证可读
         if base and y_min <= base <= y_max:
             yb = y_of(base)
-            cv.create_line(L, yb, R, yb, fill="#c9c9cd", dash=(4, 3))
-            cv.create_text(L + 4, yb - 5, text=f"昨收 {base:.2f}", fill="#a8a8a8",
-                           font=("Microsoft YaHei UI", 8), anchor="sw")
+            cv.create_line(L, yb, R, yb, fill="#4a4d58", dash=(4, 3))
+            cv.create_text(L + 4, yb - 5, text=f"昨收 {base:.2f}", fill=C_TXT_3,
+                           font=(FONT, 8), anchor="sw")
         cost_box = None
         avg = self._avg_cost()
         if not hidden and self._chart_cost_var.get() and avg and y_min <= avg <= y_max:
@@ -2196,7 +2346,7 @@ class GoldMonitorApp:
         labels.flush()
 
         # 最新价价签
-        color = "#d93025" if (base and last_p >= base) else ("#00a650" if base else "#c9a04e")
+        color = C_UP if (base and last_p >= base) else (C_DOWN if base else C_GOLD)
         self._price_tag(cv, R, x_of(n - 1), y_of(last_p), last_p, color)
 
         if hidden:
@@ -2256,8 +2406,8 @@ class GoldMonitorApp:
                                skip_y=y_of(last_c))
 
         # 顶部信息行
-        cv.create_text(L, 12, anchor="nw", fill="#8a6d2b",
-                       font=("Microsoft YaHei UI", 10, "bold"),
+        cv.create_text(L, 12, anchor="nw", fill=C_GOLD,
+                       font=(FONT, 10, "bold"),
                        text=f"黄金9999（Au99.99）历史日K  {kl[0][0]} ~ {kl[-1][0]}"
                             f"    {n} 个交易日    最新 {last_c:.2f}")
 
@@ -2266,8 +2416,8 @@ class GoldMonitorApp:
         for i, c in enumerate(closes):
             coords.extend([x_of(i), y_of(c)])
         cv.create_polygon(coords + [coords[-2], B, coords[0], B],
-                          fill="#f4ead1", outline="")
-        cv.create_line(coords, fill="#c9a04e", width=1.8)
+                          fill="#241f14", outline="")
+        cv.create_line(coords, fill=C_GOLD, width=1.8)
 
         # 持仓平均成本线画在填充之上
         cost_box = None
@@ -2322,9 +2472,9 @@ class GoldMonitorApp:
 
         # 最新价价签（较前一交易日涨跌着色）
         if n >= 2:
-            color = "#d93025" if last_c >= closes[-2] else "#00a650"
+            color = C_UP if last_c >= closes[-2] else C_DOWN
         else:
-            color = "#c9a04e"
+            color = C_GOLD
         self._price_tag(cv, R, x_of(n - 1), y_of(last_c), last_c, color)
 
         if hidden:
@@ -2364,8 +2514,8 @@ class GoldMonitorApp:
             if base:
                 chg = last_p - base
                 chg_txt = f"   较昨收 {'+' if chg >= 0 else ''}{chg:.2f}（{(last_p / base - 1) * 100:+.2f}%）"
-            cv.create_text(L, 12, anchor="nw", fill="#8a6d2b",
-                           font=("Microsoft YaHei UI", 10, "bold"),
+            cv.create_text(L, 12, anchor="nw", fill=C_GOLD,
+                           font=(FONT, 10, "bold"),
                            text=f"工银积存金 · 赎回价  {selected}"
                                 f"    最新 {last_p:.2f}   高 {pmax:.2f}   低 {pmin:.2f}{chg_txt}")
 
@@ -2382,7 +2532,7 @@ class GoldMonitorApp:
             self._draw_chart_frame(cv, L, R, T, B, 0, 1, vlines)
             cv.create_text((L + R) / 2, (T + B) / 2,
                            text="该交易日暂无本地分时数据\n可切换“今日分时（在线）”直接查看，无需程序常开",
-                           fill="#aaa", font=("Microsoft YaHei UI", 10), justify="center")
+                           fill=C_TXT_2, font=(FONT, 10), justify="center")
             self._chart_tip_var.set(
                 "本地分时需程序运行期间按分钟采集；在线模式（今日分时/历史日K）由东方财富提供，"
                 "随时可看、无需常驻。")
@@ -2410,15 +2560,15 @@ class GoldMonitorApp:
         for hm, p in pts:
             coords.extend([x_of(hm), y_of(p)])
         fill_pts = coords + [coords[-2], B, coords[0], B]
-        cv.create_polygon(fill_pts, fill="#f4ead1", outline="")
-        cv.create_line(coords, fill="#c9a04e", width=1.8)
+        cv.create_polygon(fill_pts, fill="#241f14", outline="")
+        cv.create_line(coords, fill=C_GOLD, width=1.8)
 
         # 基准线画在填充之上
         if base and y_min <= base <= y_max:
             yb = y_of(base)
-            cv.create_line(L, yb, R, yb, fill="#c9c9cd", dash=(4, 3))
-            cv.create_text(L + 4, yb - 5, text=f"昨收 {base:.2f}", fill="#a8a8a8",
-                           font=("Microsoft YaHei UI", 8), anchor="sw")
+            cv.create_line(L, yb, R, yb, fill="#4a4d58", dash=(4, 3))
+            cv.create_text(L + 4, yb - 5, text=f"昨收 {base:.2f}", fill=C_TXT_3,
+                           font=(FONT, 8), anchor="sw")
         cost_box = None
         avg = self._avg_cost()
         if is_today and not hidden and self._chart_cost_var.get() \
@@ -2458,7 +2608,7 @@ class GoldMonitorApp:
         labels.flush()
 
         # 最新价圆点与右侧价签
-        up_color = "#d93025" if (base and lpv >= base) else ("#00a650" if base else "#c9a04e")
+        up_color = C_UP if (base and lpv >= base) else (C_DOWN if base else C_GOLD)
         self._price_tag(cv, R, x_of(lhm), y_of(lpv), lpv, up_color)
 
         # 日期下拉补充新出现的交易日，保留当前选择
@@ -2478,10 +2628,11 @@ class GoldMonitorApp:
 
     def _add_trade(self):
         win = tk.Toplevel(self.root)
-        win.title("添加补仓记录")
+        win.title("记一笔补仓")
+        win.after(60, lambda w=win: _dark_title(w))
         win.geometry("310x300")
         win.resizable(False, False)
-        win.configure(bg="#f5f5f7")
+        win.configure(bg=C_BG)
         win.transient(self._trades_win or self.root)
         win.grab_set()
 
@@ -2492,21 +2643,21 @@ class GoldMonitorApp:
         buy_px = self._latest_data.get("jicun_active")
 
         def form_row(r, label, var, hint=None):
-            tk.Label(win, text=label, bg="#f5f5f7",
-                     font=("Microsoft YaHei UI", 9)).grid(
+            tk.Label(win, text=label, bg=C_BG, fg=C_TXT_2,
+                     font=(FONT, 9)).grid(
                 row=r, column=0, sticky="w", padx=16, pady=(12, 0))
             ttk.Entry(win, textvariable=var, width=17).grid(
                 row=r, column=1, padx=8, pady=(12, 0))
             if hint:
-                tk.Label(win, text=hint, bg="#f5f5f7", fg="#999",
-                         font=("Microsoft YaHei UI", 8)).grid(
+                tk.Label(win, text=hint, bg=C_BG, fg=C_TXT_3,
+                         font=(FONT, 8)).grid(
                     row=r + 1, column=1, sticky="w", padx=8)
 
         form_row(0, "买入时间", dt_var)
         form_row(2, "金额(元)", amt_var)
         form_row(4, "克数(克)", grams_var,
                  "留空则按实时买入价倒算" + (f"（当前 {buy_px:g}）" if buy_px else "，暂无报价需手填"))
-        ttk.Checkbutton(win, text="同时计入总持仓克数与成本", variable=sync_var).grid(
+        dark_checkbutton(win, "同时计入总持仓克数与成本", sync_var).grid(
             row=6, column=0, columnspan=2, sticky="w", padx=14, pady=(10, 0))
 
         def on_save():
@@ -2537,7 +2688,8 @@ class GoldMonitorApp:
             self._refresh_pl_calendar()
             win.destroy()
 
-        ttk.Button(win, text="保存", command=on_save).grid(row=7, column=0, pady=16)
+        ttk.Button(win, text="含泪记上", style="Gold.TButton",
+                   command=on_save).grid(row=7, column=0, pady=16)
         ttk.Button(win, text="取消", command=win.destroy).grid(row=7, column=1)
 
     def _delete_trade(self):
@@ -2583,19 +2735,21 @@ class GoldMonitorApp:
             self.pos_today_var.set("今日盈亏 --")
             self.pos_pl_pct_var.set("")
             self.pos_info_var.set("")
+            self._set_roast("还没录入持仓，先建个仓，我们才有故事（和眼泪）。")
             return
 
         if self.cfg.get("privacy"):
             # 隐私模式：市值/收益/成本/克数全部打码，仅保留公开行情（赎回价、日内高低）
             self.pos_mv_var.set("实时市值 ****")
             self.pos_pl_var.set("持有收益 ****（成本 **** 元/克）")
-            self.pos_pl_label.configure(fg="#888")
+            self.pos_pl_label.configure(fg=C_TXT_2)
             self.pos_pl_pct_var.set("收益率 **")
             self.pos_today_var.set("今日盈亏 ****")
-            self.pos_today_label.configure(fg="#888")
+            self.pos_today_label.configure(fg=C_TXT_2)
             self.pos_info_var.set(
                 f"持仓 ** 克｜赎回价 {sell:.2f} 元/克｜日内 "
                 f"{self._latest_high:.2f} ~ {self._latest_low:.2f}")
+            self._set_roast("打码模式已开启：赚亏都只有自己知道，群友只能看到你的淡定。")
             return
 
         mv = grams * sell
@@ -2604,15 +2758,16 @@ class GoldMonitorApp:
         self.pos_mv_var.set(f"实时市值 {mv:,.2f} 元")
         sign = "+" if pl >= 0 else ""
         self.pos_pl_var.set(f"持有收益 {sign}{pl:,.2f} 元（成本 {cost_px:.2f} 元/克）")
-        self.pos_pl_label.configure(fg="#d93025" if pl >= 0 else "#00a650")
+        self.pos_pl_label.configure(fg=C_UP if pl >= 0 else C_DOWN)
         self.pos_pl_pct_var.set(f"收益率 {sign}{pl / cost * 100:.2f}%" if cost else "")
 
         # 今日盈亏：按每晚22:30日结价（本地记录/AUTD夜盘）+ 交易记录重算，与支付宝同口径；
         # 当日22:30前用真实工行赎回价实时标记，22:30后自动转为收盘口径。
+        today_pl = None
         rows = self._daily_rows()
         if rows is None:
             self.pos_today_var.set("今日盈亏 …")
-            self.pos_today_label.configure(fg="#888")
+            self.pos_today_label.configure(fg=C_TXT_2)
         elif rows:
             last_d = max(rows)
             info = rows[last_d]
@@ -2621,22 +2776,76 @@ class GoldMonitorApp:
             self.pos_today_var.set(
                 f"{last_d[5:]} {live}盈亏 {tsign}{info['pl']:,.2f} 元")
             self.pos_today_label.configure(
-                fg="#d93025" if info["pl"] >= 0 else "#00a650")
+                fg=C_UP if info["pl"] >= 0 else C_DOWN)
+            if info["is_today"]:
+                today_pl = info["pl"]
         else:
             self.pos_today_var.set("今日盈亏 --")
-            self.pos_today_label.configure(fg="#888")
+            self.pos_today_label.configure(fg=C_TXT_2)
 
         self.pos_info_var.set(
             f"持仓 {grams:g} 克｜赎回价 {sell:.2f} 元/克｜日内 "
             f"{self._latest_high:.2f} ~ {self._latest_low:.2f}")
 
+        # 吐槽条：优先点评今日战况；今日还没数则点评总持仓
+        if today_pl is not None:
+            self._set_roast(*self._pl_roast(today_pl))
+        else:
+            self._set_roast(*self._pl_roast(pl, prefix_total=True))
+
+    def _set_roast(self, text, tone="gold"):
+        """刷新吐槽条。tone: up=红（赚）、down=绿（亏）、gold=中性。"""
+        self.roast_var.set(text)
+        if tone == "up":
+            bar_bg, fg = "#2a1718", C_UP
+        elif tone == "down":
+            bar_bg, fg = "#12241c", C_DOWN
+        else:
+            bar_bg, fg = "#221d12", C_GOLD_HI
+        self.roast_label.master.configure(bg=bar_bg)
+        self.roast_label.configure(bg=bar_bg, fg=fg)
+
+    @staticmethod
+    def _pl_roast(pl, prefix_total=False):
+        """按盈亏金额给档位文案（适度玩梗，极端行情才上重槽点）。"""
+        if prefix_total:
+            if pl >= 5000:
+                tone, txt = "up", "浮盈这个数，群里你先说话，腰杆硬。"
+            elif pl >= 1000:
+                tone, txt = "up", "累计浮盈挺体面，属于可以截图但没必要的水平。"
+            elif pl >= 50:
+                tone, txt = "up", "累计小有浮盈，奶茶钱到手，别贪。"
+            elif pl > -50:
+                tone, txt = "gold", "累计基本白玩，手续费看了都心疼。"
+            elif pl > -1000:
+                tone, txt = "down", "累计小幅浮亏，问题不大，就当给市场交了个朋友。"
+            elif pl > -5000:
+                tone, txt = "down", "累计浮亏有点扎心，但删软件也改变不了什么。"
+            else:
+                tone, txt = "down", "累计浮亏较大，建议群里装死，等风来。"
+        elif pl >= 1000:
+            tone, txt = "up", "今日暴赚！今天腰杆硬了，群里你说了算，今晚加鸡腿。"
+        elif pl >= 300:
+            tone, txt = "up", "今天行情给面儿，一顿火锅钱到手，可以发言了。"
+        elif pl >= 50:
+            tone, txt = "up", "今日小赚，一杯奶茶钱，聊胜于无。"
+        elif pl > -50:
+            tone, txt = "gold", "今日基本没波动，行情很尊重你，也很敷衍你。"
+        elif pl > -300:
+            tone, txt = "down", "今日小亏，一杯奶茶没了，问题不大。"
+        elif pl > -1000:
+            tone, txt = "down", "今日浮亏一顿火锅钱，关灯吃面，别让老婆看见。"
+        else:
+            tone, txt = "down", "今日大跌！关灯吃面，群里先潜水，我们暗中观察。"
+        return (tone, txt)
+
     # ---- 托盘 ----
     def _make_icon_image(self):
         from PIL import Image, ImageDraw
-        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        img = Image.new("RGBA", (64, 64), (15, 16, 20, 255))  # C_BG
         d = ImageDraw.Draw(img)
-        d.ellipse((4, 4, 60, 60), fill=(199, 0, 11, 255))
-        d.text((17, 16), "金", fill=(255, 255, 255, 255))
+        d.ellipse((5, 5, 59, 59), fill=(227, 192, 106, 255))  # C_GOLD
+        d.text((17, 16), "金", fill=(23, 18, 10, 255))
         return img
 
     def _build_tray(self):
@@ -2647,9 +2856,9 @@ class GoldMonitorApp:
             return
 
         menu = pystray.Menu(
-            pystray.MenuItem("显示主窗口", self._tray_show, default=True),
+            pystray.MenuItem("出来看盘", self._tray_show, default=True),
             pystray.MenuItem("立即刷新", lambda: self.root.after(0, self._poll_once)),
-            pystray.MenuItem("退出", self._tray_quit),
+            pystray.MenuItem("收摊走人", self._tray_quit),
         )
         self.tray = pystray.Icon(APP_NAME, self._make_icon_image(), APP_NAME, menu)
         threading.Thread(target=self.tray.run, daemon=True).start()
@@ -2770,8 +2979,9 @@ class GoldMonitorApp:
         self.price_var.set(f"{price:.2f}")
         if prev is not None and price != prev:
             diff = price - prev
-            color = "#00a650" if diff < 0 else "#d93025"
+            color = C_DOWN if diff < 0 else C_UP
             self.chg_var.set(f"较上次 {'↓' if diff < 0 else '↑'} {abs(diff):.2f}")
+            self.chg_label.configure(fg=color)
             self.price_label.configure(fg=color)
 
         # 首次成功取价：建立基线，不弹窗
@@ -2823,7 +3033,7 @@ class GoldMonitorApp:
         elif sell and grams > 0 and cost > 0:
             pl = grams * sell - cost
             pl_txt = f"\n持仓浮盈 {pl:+,.2f} 元（{grams:g} 克）"
-        self.toasts.show("金价跌破档位提醒", f"{name}\n{msg}{pl_txt}", duration_ms=15000)
+        self.toasts.show("金价跳水现场，注意仓位", f"{name}\n{msg}{pl_txt}", duration_ms=15000)
         if self.sound_var.get():
             try:
                 import winsound
@@ -2845,8 +3055,8 @@ class GoldMonitorApp:
 
     def _test_alert(self):
         self.toasts.show(
-            "金价跌破档位提醒（测试）",
-            f"{SOURCES[self.cfg['source']]['name']}\n当前 880.00 元/克\n跌破 890 元",
+            "金价跳水现场（测试弹）",
+            f"{SOURCES[self.cfg['source']]['name']}\n当前 880.00 元/克\n跌破 890 元\n\n别慌，这是演习，钱还在。",
             duration_ms=8000,
         )
         if self.sound_var.get():
