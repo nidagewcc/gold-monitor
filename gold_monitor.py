@@ -17,6 +17,7 @@ import ssl
 import sys
 import threading
 import time
+import calendar
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
@@ -34,6 +35,8 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+# 每日 22:30 日结价（支付宝收益口径）：黄金T+D夜盘22:30收盘价，本地逐日积累
+SETTLE_PATH = os.path.join(BASE_DIR, "settle_prices.json")
 # 本地分时行情（工行无公开历史分时接口，只能程序运行期间自行采集累积）
 HISTORY_PATH = os.path.join(BASE_DIR, "price_history.json")
 HISTORY_KEEP_DAYS = 15      # 本地分时最多保留的交易日数
@@ -51,10 +54,17 @@ EM_KLINE_URL = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
                 "?secid=118.AU9999&fields1=f1,f2,f3,f4,f5,f6"
                 "&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=0"
                 "&beg={beg}&end={end}&lmt=1000000")
+# 黄金T+D（AUTD）5分钟K：取每晚 22:30 那根K的收盘价作为积存金日结价代理。
+# 东财分钟K仅保留最近约 10 个交易日，更早日期取不到，只能本地逐日积累/截图反推。
+EM_SETTLE_URL = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
+                 "?secid=118.AUTD&fields1=f1,f2,f3,f4,f5,f6"
+                 "&fields2=f51,f52,f53,f54,f55,f56&klt=5&fqt=0"
+                 "&beg={beg}&end={end}&lmt=1000000")
 EM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
               "Referer": "https://quote.eastmoney.com/"}
 EM_TRENDS_TTL = 60     # 分时缓存秒数（交易时段内 1 分钟刷新一次即可）
 EM_KLINE_TTL = 1800    # 日K缓存秒数
+EM_SETTLE_TTL = 600    # AUTD夜盘日结价缓存秒数（夜盘22:30后10分钟内可刷新到新值）
 
 # 工行老站点使用旧版 TLS 重协商，OpenSSL 3 默认拒绝，需要显式放开
 SSL_CONTEXT = ssl.create_default_context()
@@ -89,11 +99,9 @@ DEFAULT_CONFIG = {
     # 我的持仓（工银积存金，按赎回价估值）；分发版本默认空，首次使用在“编辑”中填写
     "hold_grams": 0.0,          # 持有克数
     "hold_cost": 0.0,           # 累计投入成本（元）
-    "today_base": None,         # 今日盈亏基准价（元/克）
-    "today_base_date": None,    # 基准价所属交易日；跨日后自动滚动
-    "last_close": None,         # 最近记录的交易日最后赎回价
-    "last_close_date": None,
-    # 补仓明细（工银App交易记录，买入价=金额/克数由程序倒算）
+    # 补仓明细（工银App交易记录，买入价=金额/克数由程序倒算）。
+    # 每日盈亏不再依赖本机滚动的“今日基准价”（停电/关机易脏），
+    # 而是每日用东方财富黄金9999历史日K收盘价 + 这些交易记录直接重算。
     "trades": [],
     "privacy": False,           # 隐私模式：隐藏持仓克数/金额/盈亏（小眼睛）
 }
@@ -231,6 +239,36 @@ def save_history(hist):
         pass
 
 
+# ---------- 每日日结价（支付宝收益口径：每晚 22:30） ----------
+
+def load_settles():
+    """读取日结价：{"YYYY-MM-DD": {"price": 价, "src": icbc|alipay|em}, ...}。
+    兼容旧版仅存裸数值的写法；按日期升序返回。"""
+    out = {}
+    try:
+        with open(SETTLE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for d, v in data.items():
+            try:
+                if isinstance(v, dict):
+                    out[d] = {"price": float(v["price"]), "src": str(v.get("src") or "")}
+                else:
+                    out[d] = {"price": float(v), "src": ""}
+            except (TypeError, ValueError, KeyError):
+                continue
+    except (OSError, ValueError):
+        pass
+    return dict(sorted(out.items()))
+
+
+def save_settles(settles):
+    try:
+        with open(SETTLE_PATH, "w", encoding="utf-8") as f:
+            json.dump(settles, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
 def append_history_point(hist, day, hm, price):
     """追加一个分时点：同分钟去重（保留最新价），同日限长，返回是否发生变更。"""
     if not day or not price:
@@ -318,6 +356,118 @@ def fetch_em_daily(beg, end):
         except ValueError:
             continue
     return out
+
+
+def fetch_autd_settle(beg, end):
+    """拉黄金T+D 5分钟K（beg/end 为 "YYYYMMDD"），提取每个自然日时间戳 22:30
+    那根K的收盘价——即当晚收盘集合竞价（22:25-22:30）的成交价。
+    支付宝积存金每日收益正是按此时点的金价结算（8 日实测平均误差 0.17 元/克）。
+    返回 {"YYYY-MM-DD": 价}，东财分钟K仅保留最近约 10 个交易日。"""
+    d = (_get_em_json(EM_SETTLE_URL.format(beg=beg, end=end)) or {}).get("data") or {}
+    out = {}
+    for row in d.get("klines") or []:
+        seg = row.split(",")
+        if len(seg) < 3 or len(seg[0]) < 16 or seg[0][11:16] != "22:30":
+            continue
+        try:
+            out[seg[0][:10]] = float(seg[2])
+        except ValueError:
+            continue
+    return out
+
+
+# ---------- 每日盈亏（日结价 + 交易记录直接重算，与支付宝同口径） ----------
+
+def daily_pl_rows(settles, est_daily, trades, total_grams,
+                  live_sell=None, today=None, now_hm=None):
+    """根据每晚 22:30 日结价与买入明细，逐日重算每日盈亏（支付宝同口径）。
+
+    settles:  {"YYYY-MM-DD": 日结价} 精确价（本地记录/AUTD夜盘/支付宝反推，22:30口径）
+    est_daily: [["YYYY-MM-DD", 开, 收, 高, 低], ...] 黄金9999日K，仅用于无日结价的
+               早期日期近似（凌晨收盘口径，误差较大，行上标 est=True）
+    trades:   [{"dt": "YYYY-MM-DD HH:MM", "grams": g, "amount": a}, ...]（均为买入）
+    total_grams: 当前总持仓克数；底仓 = 总持仓 − 明细合计（早于所有记录交易的存量）
+    live_sell: 最新工行积存金赎回价。盘中（now_hm < 22:30）且 today 已有日结基准时，
+               “今日”一行按实时盈亏计算（昨夜日结价→实时赎回价）；22:30 后日结价
+               已生成，则按日结价显示“收盘”。
+    today:    实时盈亏所属交易日（"YYYY-MM-DD"），默认取序列最后一日
+    now_hm:   当前 "HH:MM"，用于判断今日是否已收盘；默认 "23:59"（视为已收盘）
+    返回 {日期: dict(close, prev, mark, grams_open, buy_g, buy_cost, pl,
+                    is_today, est)}，按日期升序。
+
+    口径（支付宝式，已用 10-26 盘中两时点证实）：
+      当日盈亏 = 当日结算持仓克数 × (今日日结价 − 上一交易日日结价)
+      当日结算持仓 = 开盘存量 + 当日买入克数（当日买入即计入，按上一交易日
+      日结价给新买入计当日盈亏；买入价只影响成本，不进入日盈亏公式）。
+    日结价优先取 settles（积存金22:30口径）；早期免费分钟K拿不到的日期，
+    用黄金9999日K收盘价近似并标记为估算。
+    """
+    est_close = {r[0]: float(r[2]) for r in (est_daily or [])}
+    close = {}
+    est_flag = {}
+    for d, p in (settles or {}).items():
+        close[d] = float(p)
+        est_flag[d] = False
+    for d, p in est_close.items():
+        if d not in close:
+            close[d] = p
+            est_flag[d] = True
+    if not close:
+        return {}
+    dates = sorted(close)
+    if today and today not in close:
+        dates2 = sorted(set(dates + [today]))
+    else:
+        dates2 = dates
+
+    # 买入按交易日归集；非交易日（周末/节假日）成交的，顺延计入之后首个有行情日
+    buy_g, buy_a = {}, {}
+    for t in trades:
+        g = float(t.get("grams") or 0)
+        a = float(t.get("amount") or 0)
+        if g <= 0:
+            continue
+        ds = str(t.get("dt", ""))[:10]
+        settle = next((d for d in dates2 if d >= ds), dates2[-1])
+        buy_g[settle] = buy_g.get(settle, 0.0) + g
+        buy_a[settle] = buy_a.get(settle, 0.0) + a
+
+    detail_g = sum(buy_g.values())
+    base_g = max(float(total_grams or 0) - detail_g, 0.0)
+    today = today or dates2[-1]
+    now_hm = now_hm or "23:59"
+
+    rows = {}
+    grams_open = base_g  # 每个交易日开盘（昨日日结后）的存量
+    prev_d, prev_c = None, None  # 上一有有效日结价的交易日（缺口日期不打断基准）
+    for d in dates2:
+        cur_c = close.get(d)
+        is_today = bool(live_sell) and d == today and now_hm <= "22:30"
+        if cur_c is None and not is_today:
+            # 既无日结价又非盘中实时（如早期缺口/非交易日）：不产出，但买入仍计入存量
+            grams_open += buy_g.get(d, 0.0)
+            continue
+        g_t, a_t = buy_g.get(d, 0.0), buy_a.get(d, 0.0)
+        if prev_c is None:
+            # 首个有效日之前没有日结基准，日价差盈亏无意义（今日盘中同理，需昨夜价）
+            grams_open += g_t
+            if cur_c is not None:
+                prev_d, prev_c = d, cur_c
+            continue
+        mark = float(live_sell) if is_today else cur_c
+        # 支付宝口径：当日买入即计入结算持仓，统一按上一交易日日结价起算
+        pl = (grams_open + g_t) * (mark - prev_c)
+        rows[d] = {
+            "close": cur_c if cur_c is not None else mark, "prev": prev_c,
+            "prev_day": prev_d, "mark": mark,
+            "grams_open": grams_open, "buy_g": g_t, "buy_cost": a_t,
+            "pl": pl, "is_today": is_today,
+            "est": bool(est_flag.get(d) or est_flag.get(prev_d)),
+        }
+        grams_open += g_t
+        if cur_c is not None:
+            prev_d, prev_c = d, cur_c
+    return rows
 
 
 # ---------- 开机自启（Windows 注册表） ----------
@@ -729,12 +879,17 @@ class GoldMonitorApp:
         self._latest_high = 0.0
         self._latest_low = 0.0
         self._latest_data = {}
-        self._trade_date = self.cfg.get("today_base_date")
+        self._trade_date = None  # 当前交易日（由行情接口给出，YYYY-MM-DD）
         self._trades_win = None  # 交易记录窗口（打开期间随行情刷新）
         self._chart_win = None   # 分时走势图窗口（打开期间随行情刷新）
+        self._pl_win = None      # 每日盈亏日历窗口
+        self._pl_cal_date = None # 日历当前展示的月份（date，取1号）
+        self._pl_selected = None # 日历选中的日期（YYYY-MM-DD）
         self._hist = load_history()  # 本地分时行情 {交易日: [["HH:MM", 价格], ...]}
         self._hist_dirty = False
         self._last_hist_save = 0.0
+        self._settles = load_settles()  # 本地日结价 {交易日: {"price","src"}}
+        self._settle_recorded_day = None  # 本次运行已自动记录日结价的交易日（防重）
         # 在线趋势（东方财富黄金9999）缓存：key -> (数据, 取数时间戳)
         self._em_cache = {}
         self._em_loading = set()  # 正在后台拉取的 key，避免重复请求
@@ -819,6 +974,10 @@ class GoldMonitorApp:
                   fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
                   activebackground="#f6edd4",
                   command=self._open_trades).pack(side="right", padx=(0, 10))
+        tk.Button(pos_head, text="盈亏日历", font=("Microsoft YaHei UI", 8),
+                  fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
+                  activebackground="#f6edd4",
+                  command=self._open_pl_calendar).pack(side="right", padx=(0, 10))
         tk.Button(pos_head, text="走势图", font=("Microsoft YaHei UI", 8),
                   fg="#8a6d2b", bg="#fffdf7", bd=0, cursor="hand2",
                   activebackground="#f6edd4",
@@ -928,29 +1087,123 @@ class GoldMonitorApp:
         if self._chart_win is not None:
             self._draw_chart()
 
-    def _roll_today_base(self, date_str):
-        """跨交易日滚动今日盈亏基准价：新交易日基准 = 上一交易日最后记录的赎回价。"""
-        sell = self._latest_sell
-        if not sell or not date_str:
+    def _set_trade_date(self, date_str):
+        """记录行情接口给出的当前交易日，供本地分时图等使用。"""
+        if date_str and date_str != self._trade_date:
+            self._trade_date = date_str
+
+    # ---- 每日盈亏：每晚22:30日结价 + 交易记录直接重算（不依赖本机常驻） ----
+    def _pl_range(self):
+        """每日盈亏取数区间：首笔买入前 20 个自然日 ~ 今天（YYYYMMDD）。"""
+        trades = self.cfg.get("trades") or []
+        dts = [str(t.get("dt", ""))[:10] for t in trades if t.get("dt")]
+        start = min(dts) if dts else (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+        beg = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=20)).strftime("%Y%m%d")
+        end = datetime.now().strftime("%Y%m%d")
+        return beg, end
+
+    def _pl_settle_map(self):
+        """合并本地日结价（含工行每晚记录/支付宝反推）与东财AUTD近10日夜盘价。
+        本地记录优先，EM 仅补充本地缺失的日期。"""
+        merged = {d: float(v["price"]) for d, v in self._settles.items() if v.get("price")}
+        cached = self._em_cache.get("settle_em")
+        if cached and time.time() - cached[1] < EM_SETTLE_TTL:
+            for d, p in (cached[0] or {}).items():
+                if d not in merged:
+                    merged[d] = p
+        return merged
+
+    def _pl_settle_sync(self):
+        """后台拉取黄金T+D近10日5分钟K（提取每晚22:30收盘）。已在拉取则跳过。"""
+        cached = self._em_cache.get("settle_em")
+        if cached and time.time() - cached[1] < EM_SETTLE_TTL:
             return
-        self._trade_date = date_str
-        new_day = self.cfg.get("today_base_date") != date_str
-        if new_day:
-            # 进入新交易日：今日基准 = 上一交易日记录的最后赎回价（首次运行时为空）
-            self.cfg["today_base"] = (
-                self.cfg.get("last_close")
-                if self.cfg.get("last_close_date") and self.cfg["last_close_date"] != date_str
-                else None)
-            self.cfg["today_base_date"] = date_str
-        # 持续记录当天最后赎回价（程序运行至收盘附近即近似收盘价）
-        self.cfg["last_close"] = sell
-        self.cfg["last_close_date"] = date_str
-        self._persist()
+        if "settle_em" in self._em_loading:
+            return
+        self._em_loading.add("settle_em")
+        end = datetime.now()
+        beg = (end - timedelta(days=14)).strftime("%Y%m%d")
+
+        def work():
+            data, err = None, None
+            try:
+                data = fetch_autd_settle(beg, end.strftime("%Y%m%d"))
+                self._em_cache["settle_em"] = (data, time.time())
+            except Exception as e:
+                err = e
+
+            def ui():
+                self._em_loading.discard("settle_em")
+                if data is not None:
+                    self._render_position()
+                    if self._pl_win is not None:
+                        self._refresh_pl_calendar()
+                    if self._chart_win is not None and \
+                            self.CHART_MODES.get(self._chart_mode_var.get()) == "local":
+                        self._draw_chart()
+                elif self._pl_win is not None:
+                    self._refresh_pl_calendar(err)
+            self.root.after(0, ui)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _pl_klines_sync(self):
+        """命中有效缓存返回黄金9999日K（仅作早期估算），否则返回 None（后台拉取）。"""
+        cached = self._em_cache.get("em_daily")
+        if cached and time.time() - cached[1] < EM_KLINE_TTL:
+            return cached[0]
+        beg, end = self._pl_range()
+        loading = "em_daily" in self._em_loading
+        if not loading:
+            self._em_loading.add("em_daily")
+
+            def work():
+                data, err = None, None
+                try:
+                    data = fetch_em_daily(beg, end)
+                    self._em_cache["em_daily"] = (data, time.time())
+                except Exception as e:
+                    err = e
+
+                def ui():
+                    self._em_loading.discard("em_daily")
+                    self._render_position()
+                    mode_var = getattr(self, "_chart_mode_var", None)
+                    if self._chart_win is not None and mode_var is not None and \
+                            self.CHART_MODES.get(mode_var.get()) == "daily":
+                        self._draw_chart()
+                    if self._pl_win is not None:
+                        self._refresh_pl_calendar(err if err is not None and not data else None)
+                self.root.after(0, ui)
+
+            threading.Thread(target=work, daemon=True).start()
+        return None
+
+    def _daily_rows(self):
+        """计算每日盈亏行。精确日结价由本地记录+AUTD夜盘提供；早期无日结价的日期
+        用黄金9999日K近似（标记估算），未就绪时触发后台拉取并返回 None。"""
+        self._pl_settle_sync()
+        settles = self._pl_settle_map()
+        if not settles:
+            return None
+        est = self._pl_klines_sync()
+        now = datetime.now()
+        now_hm = now.strftime("%H:%M")
+        live_today = self._trade_date
+        # 实时行仅在工作日交易时段（9:10-22:30）生效，避免周末/盘后陈旧报价冒充实时
+        live_sell = None
+        if live_today and now.weekday() < 5 and in_trade_session(now_hm):
+            live_sell = self._latest_sell
+        return daily_pl_rows(
+            settles, est, self.cfg.get("trades") or [],
+            float(self.cfg.get("hold_grams") or 0),
+            live_sell=live_sell, today=live_today, now_hm=now_hm)
+
 
     def _edit_position(self):
         win = tk.Toplevel(self.root)
         win.title("编辑我的持仓")
-        win.geometry("320x250")
+        win.geometry("320x200")
         win.resizable(False, False)
         win.configure(bg="#f5f5f7")
         win.transient(self.root)
@@ -958,43 +1211,35 @@ class GoldMonitorApp:
 
         grams_var = tk.StringVar(value=f"{self.cfg.get('hold_grams') or 0:g}")
         cost_var = tk.StringVar(value=f"{self.cfg.get('hold_cost') or 0:g}")
-        base_var = tk.StringVar(
-            value="" if self.cfg.get("today_base") is None
-            else f"{self.cfg['today_base']:g}")
 
         def add_row(r, label, var, hint=""):
             tk.Label(win, text=label, bg="#f5f5f7",
                      font=("Microsoft YaHei UI", 9)).grid(row=r, column=0, sticky="w",
-                                                          padx=14, pady=(10, 0))
+                                                          padx=14, pady=(14, 0))
             ttk.Entry(win, textvariable=var, width=16).grid(row=r, column=1,
-                                                            padx=8, pady=(10, 0))
+                                                            padx=8, pady=(14, 0))
             if hint:
                 tk.Label(win, text=hint, bg="#f5f5f7", fg="#999",
                          font=("Microsoft YaHei UI", 8)).grid(
                     row=r + 1, column=1, sticky="w", padx=8)
 
         add_row(0, "持有克数(克)", grams_var)
-        add_row(2, "累计投入成本(元)", cost_var)
-        add_row(4, "今日基准价(元/克)", base_var, "留空则自动用上一交易日最后价")
+        add_row(2, "累计投入成本(元)", cost_var,
+                "今日/每日盈亏按日K收盘+交易记录自动重算，无需填基准价")
 
         def on_save():
             try:
                 self.cfg["hold_grams"] = max(0.0, float(grams_var.get()))
                 self.cfg["hold_cost"] = max(0.0, float(cost_var.get()))
-                base = base_var.get().strip()
-                if base:
-                    self.cfg["today_base"] = float(base)
-                    self.cfg["today_base_date"] = self._trade_date
-                else:
-                    self.cfg["today_base"] = None
                 self._persist()
                 win.destroy()
                 self._render_position()
+                self._refresh_pl_calendar()
             except ValueError:
                 messagebox.showwarning("编辑持仓", "请填写有效的数字。", parent=win)
 
         btns = tk.Frame(win, bg="#f5f5f7")
-        btns.grid(row=6, column=0, columnspan=2, pady=16)
+        btns.grid(row=4, column=0, columnspan=2, pady=18)
         ttk.Button(btns, text="保存", command=on_save).pack(side="left", padx=8)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side="left")
 
@@ -1338,6 +1583,253 @@ class GoldMonitorApp:
         self._trades_win = None
         self._trades_tree = None
         self._trades_tip_var = None
+        if win is not None:
+            win.destroy()
+
+    # ---- 每日盈亏日历（仿支付宝：月历每格显示当日盈亏，红涨绿跌，点格看明细） ----
+    def _open_pl_calendar(self):
+        if self._pl_win is not None and tk.Toplevel.winfo_exists(self._pl_win):
+            self._pl_win.lift()
+            self._pl_win.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("每日盈亏 · 日历")
+        win.geometry("430x560")
+        win.minsize(400, 520)
+        win.configure(bg="#f5f5f7")
+        win.transient(self.root)
+
+        # 顶部：月份切换
+        head = tk.Frame(win, bg="#f5f5f7")
+        head.pack(fill="x", padx=16, pady=(14, 2))
+        self._pl_prev_btn = tk.Button(head, text="‹", font=("Microsoft YaHei UI", 14, "bold"),
+                                      fg="#8a6d2b", bg="#f5f5f7", bd=0, cursor="hand2",
+                                      activebackground="#eee", command=self._pl_prev_month)
+        self._pl_prev_btn.pack(side="left")
+        self._pl_title_var = tk.StringVar()
+        tk.Label(head, textvariable=self._pl_title_var, bg="#f5f5f7", fg="#333",
+                font=("Microsoft YaHei UI", 13, "bold")).pack(side="left", padx=14)
+        self._pl_next_btn = tk.Button(head, text="›", font=("Microsoft YaHei UI", 14, "bold"),
+                                      fg="#8a6d2b", bg="#f5f5f7", bd=0, cursor="hand2",
+                                      activebackground="#eee", command=self._pl_next_month)
+        self._pl_next_btn.pack(side="left")
+
+        # 本月合计
+        self._pl_month_var = tk.StringVar()
+        self._pl_month_label = tk.Label(win, textvariable=self._pl_month_var,
+                                        bg="#f5f5f7", fg="#666",
+                                        font=("Microsoft YaHei UI", 10, "bold"))
+        self._pl_month_label.pack(anchor="w", padx=18, pady=(2, 6))
+
+        # 星期表头
+        weekday_names = ["一", "二", "三", "四", "五", "六", "日"]
+        wd = tk.Frame(win, bg="#f5f5f7")
+        wd.pack(fill="x", padx=14)
+        for i, name in enumerate(weekday_names):
+            tk.Label(wd, text=name, bg="#f5f5f7", fg="#999",
+                    font=("Microsoft YaHei UI", 8)).grid(row=0, column=i, sticky="nsew",
+                                                        padx=2, pady=2)
+            wd.grid_columnconfigure(i, weight=1, uniform="pl")
+
+        # 日期网格容器（每月重建）
+        self._pl_grid = tk.Frame(win, bg="#f5f5f7")
+        self._pl_grid.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+        for i in range(7):
+            self._pl_grid.grid_columnconfigure(i, weight=1, uniform="pl")
+
+        # 选中日明细
+        detail_box = tk.Frame(win, bg="#fff", highlightbackground="#e5e5ea",
+                              highlightthickness=1)
+        detail_box.pack(fill="x", padx=14, pady=(2, 4))
+        self._pl_detail_var = tk.StringVar()
+        tk.Label(detail_box, textvariable=self._pl_detail_var, bg="#fff", fg="#333",
+                font=("Microsoft YaHei UI", 9), justify="left", anchor="w",
+                wraplength=380).pack(anchor="w", padx=10, pady=8)
+
+        tk.Label(win, text="每日盈亏与支付宝同口径：按每晚 22:30 黄金T+D夜盘收盘价结算"
+                          "（程序晚盘在线时自动记录工行当日最后报价，近10日自动核对东财，"
+                          "更早日期用黄金9999日K近似并标“估”）；当日盘中按实时赎回价。"
+                          "每日盈亏=(昨日存量+当日买入)×(今收−昨收)，当日买入即计入、"
+                          "统一按上一交易日日结价起算；买入价只影响成本，不参与当日盈亏。",
+                bg="#f5f5f7", fg="#aaa", font=("Microsoft YaHei UI", 7),
+                justify="left", wraplength=390).pack(anchor="w", padx=16, pady=(0, 10))
+
+        # 默认展示当月（当月无交易日则定位到最近一个有数据的月份）
+        now = datetime.now()
+        self._pl_cal_date = now.replace(day=1)
+        self._pl_selected = now.strftime("%Y-%m-%d")
+        self._pl_win = win
+        win.protocol("WM_DELETE_WINDOW", self._close_pl_calendar)
+        self._refresh_pl_calendar()
+
+    def _pl_prev_month(self):
+        d = self._pl_cal_date
+        self._pl_cal_date = (d.replace(day=1) - timedelta(days=1)).replace(day=1)
+        self._refresh_pl_calendar()
+
+    def _pl_next_month(self):
+        d = self._pl_cal_date
+        self._pl_cal_date = (d.replace(day=28) + timedelta(days=10)).replace(day=1)
+        self._refresh_pl_calendar()
+
+    def _pl_select_day(self, ds):
+        self._pl_selected = ds
+        self._refresh_pl_calendar()
+
+    def _refresh_pl_calendar(self, fetch_error=None):
+        win = self._pl_win
+        if win is None or not tk.Toplevel.winfo_exists(win):
+            return
+        hidden = bool(self.cfg.get("privacy"))
+        cur = self._pl_cal_date or datetime.now().replace(day=1)
+        rows = self._daily_rows()  # 未就绪会触发后台拉取，完成后再次刷新
+
+        self._pl_title_var.set(f"{cur.year} 年 {cur.month} 月")
+        # 月份导航边界：不晚于当前月；不早于首笔买入所在月的上一个月
+        trades = self.cfg.get("trades") or []
+        dts = sorted(str(t.get("dt", ""))[:10] for t in trades if t.get("dt"))
+        min_d = datetime.strptime(dts[0], "%Y-%m-%d").replace(day=1) if dts \
+            else (datetime.now() - timedelta(days=180)).replace(day=1)
+        now_first = datetime.now().replace(day=1)
+        self._pl_prev_btn.configure(state="normal" if cur > min_d else "disabled")
+        # 下个月按钮在 _build_grid 后根据“下月是否已有任何交易日”再定，这里先按当前月封顶
+        for child in self._pl_grid.winfo_children():
+            child.destroy()
+
+        if rows is None:
+            msg = "夜盘日结价加载中…" if not fetch_error else f"日结价获取失败：{fetch_error}\n将随下次行情刷新自动重试"
+            tk.Label(self._pl_grid, text=msg, bg="#f5f5f7", fg="#999",
+                    font=("Microsoft YaHei UI", 10), justify="center").grid(
+                row=0, column=0, columnspan=7, pady=40)
+            self._pl_month_var.set("本月盈亏 …")
+            self._pl_detail_var.set("正在获取黄金T+D近10日夜盘日结价…")
+            return
+
+        # 本月盈亏合计（仅日历区间内的交易日）
+        month_rows = {d: r for d, r in rows.items()
+                      if d.startswith(cur.strftime("%Y-%m"))}
+        month_sum = sum(r["pl"] for r in month_rows.values())
+        n_trade = len(month_rows)
+        if hidden:
+            self._pl_month_var.set(f"本月（{n_trade} 个交易日）盈亏 ****")
+        elif n_trade:
+            sgn = "+" if month_sum >= 0 else ""
+            color = "#d93025" if month_sum >= 0 else "#00a650"
+            self._pl_month_var.set(
+                f"本月（{n_trade} 个交易日）盈亏  {sgn}{month_sum:,.2f} 元")
+            self._pl_month_label.configure(fg=color)
+        else:
+            self._pl_month_var.set("本月暂无交易日")
+            self._pl_month_label.configure(fg="#999")
+
+        # 下个月是否有交易日数据：有则允许前进；封顶当前月
+        nxt = (cur.replace(day=28) + timedelta(days=10)).replace(day=1)
+        has_next = nxt <= now_first or any(d.startswith(nxt.strftime("%Y-%m")) for d in rows)
+        self._pl_next_btn.configure(state="normal" if has_next else "disabled")
+
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        cal = calendar.Calendar(firstweekday=0)  # 周一起
+        weeks = cal.monthdatescalendar(cur.year, cur.month)
+        for wi, week in enumerate(weeks):
+            for di, daydate in enumerate(week):
+                ds = daydate.strftime("%Y-%m-%d")
+                in_month = daydate.month == cur.month
+                info = rows.get(ds)
+                cell = self._pl_day_cell(self._pl_grid, ds, daydate.day, info,
+                                         in_month, hidden, ds == today_str,
+                                         ds == self._pl_selected)
+                cell.grid(row=wi, column=di, sticky="nsew", padx=2, pady=2)
+            self._pl_grid.grid_rowconfigure(wi, weight=1)
+
+        self._render_pl_detail(rows, hidden, today_str)
+
+    def _pl_day_cell(self, parent, ds, daynum, info, in_month, hidden, is_today, selected):
+        bg = "#fff" if in_month else "#fafafa"
+        fg_day = "#bbb" if not in_month else "#555"
+        if info is not None and in_month:
+            if info["pl"] > 0.005:
+                pl_color = "#d93025"
+            elif info["pl"] < -0.005:
+                pl_color = "#00a650"
+            else:
+                pl_color = "#999"
+        else:
+            pl_color = "#ccc"
+        if selected and in_month:
+            bg = "#f6edd4"
+        cell = tk.Frame(parent, bg=bg, highlightbackground=(
+                        "#c9a04e" if selected else "#ececec"),
+                        highlightthickness=(1.5 if selected else 1), cursor="hand2")
+        head_txt = str(daynum) + (" 今" if is_today and in_month else "")
+        head = tk.Frame(cell, bg=bg)
+        head.pack(fill="x", padx=5, pady=(3, 0))
+        tk.Label(head, text=head_txt, bg=bg, fg=fg_day,
+                font=("Microsoft YaHei UI", 8, "bold" if is_today else "normal")).pack(side="left")
+        if info is not None and info.get("est"):
+            tk.Label(head, text="估", bg=bg, fg="#a98a2e",
+                    font=("Microsoft YaHei UI", 7, "bold")).pack(side="right")
+        if in_month:
+            if info is None:
+                tk.Label(cell, text="—", bg=bg, fg="#ddd",
+                        font=("Microsoft YaHei UI", 8)).pack(anchor="e", padx=5, pady=(0, 3))
+            elif hidden:
+                tk.Label(cell, text="****", bg=bg, fg=pl_color,
+                        font=("Microsoft YaHei UI", 8, "bold")).pack(
+                    anchor="e", padx=5, pady=(0, 3))
+            else:
+                tk.Label(cell, text=f"{info['pl']:+,.0f}", bg=bg, fg=pl_color,
+                        font=("Microsoft YaHei UI", 9, "bold")).pack(
+                    anchor="e", padx=5, pady=(0, 3))
+            for w in cell.winfo_children():
+                w.bind("<Button-1>", lambda e, d=ds: self._pl_select_day(d))
+            cell.bind("<Button-1>", lambda e, d=ds: self._pl_select_day(d))
+        return cell
+
+    def _render_pl_detail(self, rows, hidden, today_str):
+        ds = self._pl_selected
+        info = rows.get(ds) if ds else None
+        if info is None:
+            self._pl_detail_var.set(
+                f"{ds or '未选择日期'}：非交易日或无盈亏数据。点上方有数字的日期查看明细。")
+            return
+        weekday = "一二三四五六日"[datetime.strptime(ds, "%Y-%m-%d").weekday()]
+        if info["is_today"] or ds == today_str:
+            tag = "（今日实时）"
+        elif info.get("est"):
+            tag = "（估算·黄金9999日K近似）"
+        else:
+            tag = "（收盘·22:30夜盘结算）"
+        chg = info["mark"] - info["prev"]
+        hold_pl = info["grams_open"] * chg
+        # 支付宝口径：当日买入即计入结算持仓，与存量统一按上一交易日日结价起算
+        buy_pl = info["buy_g"] * chg
+        if hidden:
+            self._pl_detail_var.set(
+                f"{ds} 周{weekday}{tag}\n"
+                f"昨收 {info['prev']:.2f} → 今值 {info['mark']:.2f}（{chg:+.2f}）｜"
+                f"存量 {info['grams_open']:.4f} 克\n"
+                f"存量盈亏 ****｜当日买入盈亏 ****｜合计盈亏 ****")
+            return
+        lines = [
+            f"{ds} 周{weekday}{tag}",
+            f"昨收 {info['prev']:.2f} → 今值 {info['mark']:.2f}（{chg:+.2f} 元/克）"
+            f"｜昨日存量 {info['grams_open']:.4f} 克",
+            f"存量盈亏 {hold_pl:+,.2f} 元",
+        ]
+        if info["buy_g"] > 0:
+            px = info["buy_cost"] / info["buy_g"]
+            lines.append(
+                f"当日买入 {info['buy_g']:.4f} 克 @ {px:.2f}（{info['buy_cost']:,.0f} 元）"
+                f"｜买入计入盈亏 {buy_pl:+,.2f} 元（按上一交易日日结价起算）")
+        sgn = "+" if info["pl"] >= 0 else ""
+        lines.append(f"当日合计盈亏 {sgn}{info['pl']:,.2f} 元")
+        if info.get("est"):
+            lines.append("注：该日无22:30夜盘日结价记录，按黄金9999日收盘价近似。")
+        self._pl_detail_var.set("\n".join(lines))
+
+    def _close_pl_calendar(self):
+        win = self._pl_win
+        self._pl_win = None
         if win is not None:
             win.destroy()
 
@@ -1719,12 +2211,7 @@ class GoldMonitorApp:
     # ---------- 在线：黄金9999 历史日K（收盘折线 + 全部买点） ----------
     def _draw_em_daily(self, cv, L, R, T, B):
         hidden = bool(self.cfg.get("privacy"))
-        trades = [t for t in (self.cfg.get("trades") or [])
-                  if float(t.get("grams") or 0) > 0]
-        dts = [str(t.get("dt", ""))[:10] for t in trades if t.get("dt")]
-        start = min(dts) if dts else (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
-        beg = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=15)).strftime("%Y%m%d")
-        end = datetime.now().strftime("%Y%m%d")
+        beg, end = self._pl_range()
 
         def loader():
             return fetch_em_daily(beg, end)
@@ -1869,7 +2356,10 @@ class GoldMonitorApp:
             pmax = max(p for _, p in pts)
             pmin = min(p for _, p in pts)
             last_p = pts[-1][1]
-            base = self.cfg.get("today_base") if selected == self.cfg.get("today_base_date") else None
+            base = None  # 昨收基准：上一交易日22:30夜盘日结价（早期缺口日为9999日K近似）
+            _rows = self._daily_rows()
+            if _rows and selected in _rows:
+                base = _rows[selected]["prev"]
             chg_txt = ""
             if base:
                 chg = last_p - base
@@ -2044,6 +2534,7 @@ class GoldMonitorApp:
             self._persist()
             self._render_position()
             self._refresh_trades()
+            self._refresh_pl_calendar()
             win.destroy()
 
         ttk.Button(win, text="保存", command=on_save).grid(row=7, column=0, pady=16)
@@ -2079,6 +2570,7 @@ class GoldMonitorApp:
         self._persist()
         self._render_position()
         self._refresh_trades()
+        self._refresh_pl_calendar()
 
     def _render_position(self):
         """根据最新赎回价计算并刷新持仓卡片。"""
@@ -2115,27 +2607,21 @@ class GoldMonitorApp:
         self.pos_pl_label.configure(fg="#d93025" if pl >= 0 else "#00a650")
         self.pos_pl_pct_var.set(f"收益率 {sign}{pl / cost * 100:.2f}%" if cost else "")
 
-        # 今日盈亏（与支付宝同口径）：昨日存量按昨收基准价，
-        # 今日新买入的克数按其成交价（金额÷克数倒算）起算
-        base = self.cfg.get("today_base")
-        today_date = self.cfg.get("today_base_date")
-        today_pl = None
-        if base:
-            old_g = grams
-            today_pl = 0.0
-            for t in self.cfg.get("trades") or []:
-                if str(t.get("dt", ""))[:10] != today_date:
-                    continue
-                g_t = float(t.get("grams") or 0)
-                a_t = float(t.get("amount") or 0)
-                if g_t > 0:
-                    today_pl += g_t * (sell - a_t / g_t)
-                    old_g -= g_t
-            today_pl += max(old_g, 0.0) * (sell - base)
-        if today_pl is not None:
-            tsign = "+" if today_pl >= 0 else ""
-            self.pos_today_var.set(f"今日盈亏 {tsign}{today_pl:,.2f} 元")
-            self.pos_today_label.configure(fg="#d93025" if today_pl >= 0 else "#00a650")
+        # 今日盈亏：按每晚22:30日结价（本地记录/AUTD夜盘）+ 交易记录重算，与支付宝同口径；
+        # 当日22:30前用真实工行赎回价实时标记，22:30后自动转为收盘口径。
+        rows = self._daily_rows()
+        if rows is None:
+            self.pos_today_var.set("今日盈亏 …")
+            self.pos_today_label.configure(fg="#888")
+        elif rows:
+            last_d = max(rows)
+            info = rows[last_d]
+            tsign = "+" if info["pl"] >= 0 else ""
+            live = "实时" if info["is_today"] else "收盘"
+            self.pos_today_var.set(
+                f"{last_d[5:]} {live}盈亏 {tsign}{info['pl']:,.2f} 元")
+            self.pos_today_label.configure(
+                fg="#d93025" if info["pl"] >= 0 else "#00a650")
         else:
             self.pos_today_var.set("今日盈亏 --")
             self.pos_today_label.configure(fg="#888")
@@ -2192,6 +2678,7 @@ class GoldMonitorApp:
         self._persist()
         if self._hist_dirty:
             save_history(self._hist)
+        save_settles(self._settles)
         self.root.destroy()
 
     # ---- 取价轮询 ----
@@ -2213,6 +2700,26 @@ class GoldMonitorApp:
         self.status_var.set(
             f"[{datetime.now():%H:%M:%S}] 行情获取失败（连续 {self.failed_count} 次）：{err}")
         self._schedule_next()
+
+    def _maybe_record_settle(self, sell):
+        """本机时间进入 22:29-22:30 收盘窗口时，用工行积存金实时赎回价记录当日日结价
+        （当日最后一次报价，与支付宝每日收益口径一致）。窗口内新报价会刷新；
+        人工录入（alipay）不覆盖。仅工作日触发。"""
+        now = datetime.now()
+        hm = now.strftime("%H:%M")
+        if not sell or now.weekday() >= 5 or not ("22:29" <= hm <= "22:30"):
+            return
+        day = now.strftime("%Y-%m-%d")
+        old = self._settles.get(day)
+        if old and old.get("src") != "icbc":
+            return  # 支付宝截图反推等精确人工价优先，不自动覆盖
+        price = float(sell)
+        if old and abs(float(old.get("price") or 0) - price) < 1e-9:
+            return
+        self._settles[day] = {"price": price, "src": "icbc"}
+        self._settles = dict(sorted(self._settles.items()))
+        save_settles(self._settles)
+        self._settle_recorded_day = day
 
     def _on_data(self, data):
         self.failed_count = 0
@@ -2242,10 +2749,14 @@ class GoldMonitorApp:
                 save_history(self._hist)
                 self._hist_dirty = False
                 self._last_hist_save = now_ts
-        self._roll_today_base(data.get("date"))
+        # 22:30 收盘窗口：用工行积存金赎回价记录当日日结价（当晚最后一次报价）
+        self._maybe_record_settle(sell0)
+        self._set_trade_date(data.get("date"))
         self._render_position()
         if self._trades_win is not None:
             self._refresh_trades()
+        if self._pl_win is not None:
+            self._refresh_pl_calendar()
         if self._chart_win is not None:
             self._draw_chart()
 
