@@ -17,6 +17,7 @@ import ssl
 import sys
 import threading
 import time
+import traceback
 import calendar
 import urllib.request
 import urllib.parse
@@ -39,6 +40,9 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 SETTLE_PATH = os.path.join(BASE_DIR, "settle_prices.json")
 # 本地分时行情（工行无公开历史分时接口，只能程序运行期间自行采集累积）
 HISTORY_PATH = os.path.join(BASE_DIR, "price_history.json")
+# 崩溃日志：windowed（无控制台）打包后异常会静默退出，统一落盘便于排查
+ERROR_PATH = os.path.join(BASE_DIR, "error.log")
+ERROR_LOG_MAX = 512 * 1024  # error.log 超过 512KB 则滚动保留前半段
 HISTORY_KEEP_DAYS = 15      # 本地分时最多保留的交易日数
 HISTORY_MAX_POINTS = 900    # 每个交易日最多点数（按分钟去重，全天约 800 个）
 
@@ -65,6 +69,8 @@ EM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebK
 EM_TRENDS_TTL = 60     # 分时缓存秒数（交易时段内 1 分钟刷新一次即可）
 EM_KLINE_TTL = 1800    # 日K缓存秒数
 EM_SETTLE_TTL = 600    # AUTD夜盘日结价缓存秒数（夜盘22:30后10分钟内可刷新到新值）
+# 工作日 22:35 起自动对齐当晚支付宝口径日结价（AUTD 22:30 五分钟K收盘）
+SETTLE_SYNC_HM = "22:35"
 
 # 工行老站点使用旧版 TLS 重协商，OpenSSL 3 默认拒绝，需要显式放开
 SSL_CONTEXT = ssl.create_default_context()
@@ -104,6 +110,10 @@ DEFAULT_CONFIG = {
     # 而是每日用东方财富黄金9999历史日K收盘价 + 这些交易记录直接重算。
     "trades": [],
     "privacy": False,           # 隐私模式：隐藏持仓克数/金额/盈亏（小眼睛）
+    "alert_up": True,           # 上涨穿越档位也提醒（回本/起飞一起 happy）
+    # 补仓计划：[{"price": 目标买入价, "grams": 计划克数}]，
+    # 买入价下穿目标价时弹窗提醒按计划补仓，走势图上以蓝色虚线标记
+    "plans": [],
     "theme": "dark",            # 界面主题：dark（黑金暗色）/ light（浅色日间）
 }
 
@@ -152,6 +162,8 @@ THEMES = {
         "C_ICON_DISK": "#191b21",  # 应用图标盘心色
         "C_COST":     "#ffb36b",   # 持仓成本线标注（橙）
         "C_COST_LINE": "#e8924a",  # 持仓成本虚线
+        "C_PLAN":     "#7fb6ff",   # 补仓计划价标注（蓝）
+        "C_PLAN_LINE": "#5a93e8",  # 补仓计划虚线
     },
     "light": {
         "C_BG":       "#f4f1ea",   # 窗口底色（暖米白）
@@ -187,6 +199,8 @@ THEMES = {
         "C_ICON_DISK": "#ffffff",
         "C_COST":     "#b8651a",
         "C_COST_LINE": "#c07a26",
+        "C_PLAN":     "#2f6fd0",
+        "C_PLAN_LINE": "#2f6fd0",
     },
 }
 
@@ -832,6 +846,23 @@ def crossed_tiers(prev_price, price, step):
     return crossed
 
 
+def crossed_tiers_up(prev_price, price, step):
+    """
+    返回价格从 prev_price 涨到 price 过程中向上穿越的所有档位线（升序）。
+    与 crossed_tiers 对称：严格穿越，档位线 t 满足 prev_price < t <= price。
+    """
+    if prev_price is None or price is None or price <= prev_price:
+        return []
+    crossed = []
+    k_lo = math.floor(prev_price / step) + 1
+    k_hi = math.floor(price / step)
+    for k in range(k_lo, k_hi + 1):
+        t = k * step
+        if prev_price < t <= price:
+            crossed.append(t)
+    return crossed
+
+
 # ---------- 右下角提醒弹窗 ----------
 
 class ToastManager:
@@ -854,8 +885,9 @@ class ToastManager:
             pass
         return sw, sh
 
-    def show(self, title, message, tag=None, duration_ms=12000):
-        """在主线程调用。"""
+    def show(self, title, message, tag=None, duration_ms=12000, kind="down"):
+        """在主线程调用。kind: "down" 红色顶条（跳水警报）/ "up" 金色顶条（上涨喜报）
+        / "plan" 蓝色顶条（补仓计划到价）。"""
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
 
@@ -867,15 +899,23 @@ class ToastManager:
         except tk.TclError:
             pass
 
-        frame = tk.Frame(win, bg=C_CARD, highlightbackground=C_UP,
+        if kind == "up":
+            bar, on_bar = C_GOLD, C_ON_GOLD
+        elif kind == "plan":
+            bar, on_bar = C_PLAN_LINE, "#ffffff"
+        else:
+            bar, on_bar = C_UP, C_ON_UP
+        frame = tk.Frame(win, bg=C_CARD, highlightbackground=bar,
                          highlightthickness=1, bd=0)
         frame.pack(fill="both", expand=True)
 
-        top = tk.Frame(frame, bg=C_UP, height=30)
+        top = tk.Frame(frame, bg=bar, height=30)
         top.pack(fill="x")
-        tk.Label(top, text=f"⚠  {title}", bg=C_UP, fg=C_ON_UP,
-                font=(FONT, 10, "bold")).pack(side="left", padx=10, pady=4)
-        close = tk.Label(top, text="✕", bg=C_UP, fg=C_ON_UP,
+        emoji = {"up": "🎉", "plan": "🛒"}.get(kind, "⚠")
+        tk.Label(top, text=f"{emoji}  {title}",
+                 bg=bar, fg=on_bar,
+                 font=(FONT, 10, "bold")).pack(side="left", padx=10, pady=4)
+        close = tk.Label(top, text="✕", bg=bar, fg=on_bar,
                          font=(FONT, 9), cursor="hand2")
         close.pack(side="right", padx=8)
 
@@ -1194,6 +1234,8 @@ class GoldMonitorApp:
         self._trade_date = None  # 当前交易日（由行情接口给出，YYYY-MM-DD）
         self._trades_win = None  # 交易记录窗口（打开期间随行情刷新）
         self._chart_win = None   # 分时走势图窗口（打开期间随行情刷新）
+        self._plans_win = None   # 补仓计划窗口
+        self._plans_tree = None
         self._pl_win = None      # 每日盈亏日历窗口
         self._pl_cal_date = None # 日历当前展示的月份（date，取1号）
         self._pl_selected = None # 日历选中的日期（YYYY-MM-DD）
@@ -1202,6 +1244,12 @@ class GoldMonitorApp:
         self._last_hist_save = 0.0
         self._settles = load_settles()  # 本地日结价 {交易日: {"price","src"}}
         self._settle_recorded_day = None  # 本次运行已自动记录日结价的交易日（防重）
+        self._settle_aligned_day = None   # 本次运行已对齐支付宝口径日结价的交易日
+        self._settle_backfilled = False   # 启动后是否已回补近期缺失日结价
+        self._settle_syncing = False      # AUTD 对齐请求是否在途
+        # 补仓计划到价状态：{计划价: 是否已弹过提醒}；首个买入价建立基线，
+        # 基线价之下的计划默认已触发状态（不打扰），价格涨回去后重新武装
+        self._plans_fired = None
         # 在线趋势（东方财富黄金9999）缓存：key -> (数据, 取数时间戳)
         self._em_cache = {}
         self._em_loading = set()  # 正在后台拉取的 key，避免重复请求
@@ -1214,6 +1262,8 @@ class GoldMonitorApp:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self.root.after(300, self._poll_once)
         self.root.after(1200, self._pulse_dot)
+        # 启动后稍等即回补近期缺失的支付宝口径日结价，之后每 5 分钟检查夜间对齐
+        self.root.after(5000, self._settle_tick)
 
     # ---- UI ----
     def _fit_window(self):
@@ -1457,6 +1507,11 @@ class GoldMonitorApp:
         self.sound_var = tk.BooleanVar(value=self.cfg["sound"])
         dark_checkbutton(checks, "破位时播放提示音", self.sound_var,
                          bg=C_CARD).pack(anchor="w", pady=2)
+        self.alert_up_var = tk.BooleanVar(value=self.cfg.get("alert_up", True))
+        dark_checkbutton(checks, "涨破档位也提醒（回本/起飞喊我）", self.alert_up_var,
+                         bg=C_CARD,
+                         command=lambda: (self.cfg.__setitem__("alert_up", self.alert_up_var.get()),
+                                          self._persist())).pack(anchor="w", pady=2)
         self.autostart_var = tk.BooleanVar(value=self.cfg["autostart"])
         dark_checkbutton(checks, "开机自动启动（一起床就看盘）", self.autostart_var,
                          bg=C_CARD, command=self._on_autostart).pack(anchor="w", pady=2)
@@ -1973,6 +2028,8 @@ class GoldMonitorApp:
         btns.pack(fill="x", padx=16, pady=(0, 12))
         ttk.Button(btns, text="记一笔补仓", style="Gold.TButton",
                    command=self._add_trade).pack(side="left")
+        ttk.Button(btns, text="补仓计划价",
+                   command=self._open_plans).pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="删除选中", command=self._delete_trade).pack(side="left", padx=8)
         ttk.Button(btns, text="关闭", command=self._close_trades).pack(side="right")
 
@@ -2385,6 +2442,11 @@ class GoldMonitorApp:
                                        highlightthickness=0, height=400)
         self._chart_canvas.pack(fill="both", expand=True)
         self._chart_canvas.bind("<Configure>", lambda _=None: self._draw_chart())
+        self._chart_canvas.bind("<Motion>", self._on_chart_motion)
+        self._chart_canvas.bind("<Leave>", self._on_chart_leave)
+        # 十字光标命中点数据（由各渲染函数写入：(x, y, 时间标签, 价格) 列表）
+        self._chart_pts = None
+        self._chart_cross = None  # 十字光标的画布 item id 集合
 
         self._chart_tip_var = tk.StringVar(value="")
         tk.Label(win, textvariable=self._chart_tip_var, bg=C_BG, fg=C_TXT_3,
@@ -2407,6 +2469,9 @@ class GoldMonitorApp:
         self._chart_mode_combo = None
         self._chart_refresh_btn = None
         self._chart_tip_var = None
+        self._chart_pts = None
+        self._chart_geom = None
+        self._chart_tip_base = ""
         if win is not None:
             win.destroy()
 
@@ -2416,10 +2481,67 @@ class GoldMonitorApp:
         return int(h) * 60 + int(m)
 
     @staticmethod
-    def _dot(cv, x, y, r=4.5, color="#ff9e4d"):
-        """买点 / 端点圆点：实心 + 画布色描边。"""
+    def _cv_dot(cv, x, y, r=4.5, color="#ff9e4d"):
+        """买点 / 端点圆点：实心 + 画布色描边。（勿与状态灯 self._dot 同名）"""
         cv.create_oval(x - r, y - r, x + r, y + r,
                        fill=color, outline=C_CHART, width=1.6)
+
+    def _on_chart_leave(self, _=None):
+        """鼠标离开画布：清除十字光标与底部读数。"""
+        self._clear_crosshair()
+        if self._chart_tip_var is not None:
+            self._chart_tip_var.set(self._chart_tip_base or "")
+
+    def _clear_crosshair(self):
+        cv = self._chart_canvas
+        if cv is not None:
+            cv.delete("crosshair")
+        self._chart_cross = None
+
+    def _on_chart_motion(self, ev):
+        """十字光标：横向吸附到最近的数据点，纵向跟随鼠标。"""
+        cv = self._chart_canvas
+        pts = self._chart_pts
+        geom = self._chart_geom
+        if cv is None or not pts or not geom:
+            return
+        L, R, T, B = geom
+        if not (L - 4 <= ev.x <= R + 4 and T - 4 <= ev.y <= B + 4):
+            self._clear_crosshair()
+            return
+        i = min(range(len(pts)), key=lambda k: abs(pts[k][0] - ev.x))
+        px, py, lab, price = pts[i]
+        self._clear_crosshair()
+        items = []
+        # 两条虚线
+        items.append(cv.create_line(px, T, px, B, fill=C_REF_DASH,
+                                    dash=(3, 3), tags="crosshair"))
+        items.append(cv.create_line(L, ev.y, R, ev.y, fill=C_REF_DASH,
+                                    dash=(3, 3), tags="crosshair"))
+        # 吸附点高亮
+        items.append(cv.create_oval(px - 4, py - 4, px + 4, py + 4,
+                                    fill=C_GOLD_HI, outline=C_CHART, width=1.4,
+                                    tags="crosshair"))
+        # 右轴浮动价签（纵向跟随鼠标，显示吸附点价格）
+        tag_w = 52
+        ty = min(max(ev.y, T + 9), B - 9)
+        cv.create_rectangle(R + 2, ty - 9, R + tag_w, ty + 9,
+                            fill=C_GOLD, outline="", tags="crosshair")
+        items.append(cv.create_text(R + tag_w / 2 - 2, ty,
+                                    text=f"{price:.2f}", fill=C_ON_GOLD,
+                                    font=(FONT, 8, "bold"), tags="crosshair"))
+        # 底部时间气泡
+        tw = max(58, 7 * len(lab) + 12)
+        tx = min(max(px, L + tw / 2), R - tw / 2)
+        cv.create_rectangle(tx - tw / 2, B + 16, tx + tw / 2, B + 32,
+                            fill=C_CARD_2, outline=C_LINE, tags="crosshair")
+        items.append(cv.create_text(tx, B + 24, text=lab, fill=C_TXT,
+                                    font=(FONT, 8), tags="crosshair"))
+        self._chart_cross = items
+        # 底部提示行同步读数
+        if self._chart_tip_var is not None:
+            self._chart_tip_var.set(
+                f"{lab}    价格 {price:.2f} 元/克｜{self._chart_tip_base or ''}")
 
     # ---- 走势图（三模式：在线分时 / 在线历史日K / 本地采集分时） ----
     CHART_MODES = {"今日分时（在线）": "today",
@@ -2444,9 +2566,13 @@ class GoldMonitorApp:
         cv.delete("all")
         cv.update_idletasks()
         self._chart_seq += 1  # 代际令牌：使切模式前在途的在线回调失效
+        self._chart_pts = None  # 十字光标命中点随重绘失效
+        self._chart_cross = None
+        self._chart_tip_base = ""
         w = max(cv.winfo_width(), 700)
         h = max(cv.winfo_height(), 360)
         L, R, T, B = 18, w - 78, 46, h - 38
+        self._chart_geom = (L, R, T, B)
         mode = self.CHART_MODES.get(self._chart_mode_var.get(), "today")
         if mode == "today":
             self._draw_em_trend(cv, L, R, T, B)
@@ -2546,9 +2672,35 @@ class GoldMonitorApp:
         cv.tag_lower(rid, tid)
         return (x1 - 5, y1 - 2, x2 + 5, y2 + 2)
 
+    def _plan_lines(self, cv, L, R, y_of, y_min, y_max, hidden):
+        """补仓计划价蓝色虚线（含标签避让框），返回标签占位矩形列表。"""
+        if hidden:
+            return []
+        boxes = []
+        plans = sorted((float(p.get("price") or 0) for p in (self.cfg.get("plans") or [])),
+                       reverse=True)
+        prev_y = None
+        for target in plans:
+            if target <= 0 or not (y_min <= target <= y_max):
+                continue
+            yp = y_of(target)
+            cv.create_line(L, yp, R, yp, fill=C_PLAN_LINE, dash=(2, 3), width=1)
+            txt = f"补仓计划 {target:g}"
+            # 与上一条计划标签错开，避免重叠
+            ty = yp - 6 if (prev_y is None or abs(prev_y - yp) > 26) else yp + 14
+            prev_y = ty
+            tid = cv.create_text(L + 6, ty, anchor="sw", text=txt,
+                                 fill=C_PLAN, font=(FONT, 8))
+            x1, y1, x2, y2 = cv.bbox(tid)
+            rid = cv.create_rectangle(x1 - 5, y1 - 2, x2 + 5, y2 + 2,
+                                      fill=C_CHART, outline=C_PLAN_LINE)
+            cv.tag_lower(rid, tid)
+            boxes.append((x1 - 5, y1 - 2, x2 + 5, y2 + 2))
+        return boxes
+
     def _price_tag(self, cv, R, x, y, price, color):
         """最新价：曲线端点圆点 + 细引线 + 右轴区圆角实心价签（同时覆盖该处刻度）。"""
-        self._dot(cv, x, y, r=4.5, color=color)
+        self._cv_dot(cv, x, y, r=4.5, color=color)
         if x < R - 6:
             cv.create_line(x + 5, y, R - 2, y, fill=color, width=1)
         tag_w = 52
@@ -2609,6 +2761,10 @@ class GoldMonitorApp:
         y_lo, y_hi = min(prices), max(prices)
         if base:
             y_lo, y_hi = min(y_lo, base), max(y_hi, base)
+        if not hidden:
+            for _p in (float(x.get("price") or 0) for x in (self.cfg.get("plans") or [])):
+                if _p > 0:
+                    y_lo, y_hi = min(y_lo, _p), max(y_hi, _p)
         pad = max((y_hi - y_lo) * 0.15, 0.3)
         y_min, y_max = y_lo - pad, y_hi + pad
 
@@ -2663,12 +2819,14 @@ class GoldMonitorApp:
         avg = self._avg_cost()
         if not hidden and self._chart_cost_var.get() and avg and y_min <= avg <= y_max:
             cost_box = self._avg_cost_line(cv, L, R, y_of, avg)
+        plan_boxes = self._plan_lines(cv, L, R, y_of, y_min, y_max, hidden)
 
         # 标签统一防碰撞布局（高低点 + 买点）；右轴价签区/成本标签预留避让
         tag_y = y_of(last_p)
         reserve = [(R - 6, tag_y - 12, R + 56, tag_y + 12)]
         if cost_box:
             reserve.append(cost_box)
+        reserve.extend(plan_boxes)
         labels = _ChartLabels(cv, L, R, T, B, reserve=reserve)
         hi_idx = max(range(n), key=lambda i: pts[i][1])
         lo_idx = min(range(n), key=lambda i: pts[i][1])
@@ -2700,13 +2858,16 @@ class GoldMonitorApp:
         self._price_tag(cv, R, x_of(n - 1), y_of(last_p), last_p, color)
 
         if hidden:
-            self._chart_tip_var.set(
+            self._chart_tip_base = (
                 "在线分时：东方财富黄金9999（与积存金同源，点差通常 0~1 元/克）；"
                 "隐私模式下买入点位与成本线已隐藏。")
         else:
-            self._chart_tip_var.set(
+            self._chart_tip_base = (
                 "金色曲线=东方财富黄金9999在线分时（无需程序常开）｜橙点=当日买入成交价"
-                "｜橙色虚线=当前持仓加权平均成本")
+                "｜橙色虚线=持仓成本｜蓝色虚线=补仓计划价（鼠标移动可看任意时点价格）")
+        self._chart_pts = [(x_of(i), y_of(p), f"{date} {hm}", p)
+                           for i, (hm, p) in enumerate(pts)]
+        self._chart_tip_var.set(self._chart_tip_base)
 
     # ---------- 在线：黄金9999 历史日K（收盘折线 + 全部买点） ----------
     def _draw_em_daily(self, cv, L, R, T, B):
@@ -2739,6 +2900,10 @@ class GoldMonitorApp:
         n = len(kl)
         closes = [r[2] for r in kl]
         y_lo, y_hi = min(closes), max(closes)
+        if not hidden:
+            for _p in (float(x.get("price") or 0) for x in (self.cfg.get("plans") or [])):
+                if _p > 0:
+                    y_lo, y_hi = min(y_lo, _p), max(y_hi, _p)
         pad = max((y_hi - y_lo) * 0.08, 0.5)
         y_min, y_max = y_lo - pad, y_hi + pad
 
@@ -2774,12 +2939,14 @@ class GoldMonitorApp:
         avg = self._avg_cost()
         if not hidden and self._chart_cost_var.get() and avg and y_min <= avg <= y_max:
             cost_box = self._avg_cost_line(cv, L, R, y_of, avg)
+        plan_boxes = self._plan_lines(cv, L, R, y_of, y_min, y_max, hidden)
 
         # 标签统一防碰撞布局（区间高低点 + 全部买点）；右轴价签区/成本标签预留避让
         tag_y = y_of(last_c)
         reserve = [(R - 6, tag_y - 12, R + 56, tag_y + 12)]
         if cost_box:
             reserve.append(cost_box)
+        reserve.extend(plan_boxes)
         labels = _ChartLabels(cv, L, R, T, B, reserve=reserve)
         hi_idx = max(range(n), key=lambda i: closes[i])
         lo_idx = min(range(n), key=lambda i: closes[i])
@@ -2828,12 +2995,16 @@ class GoldMonitorApp:
         self._price_tag(cv, R, x_of(n - 1), y_of(last_c), last_c, color)
 
         if hidden:
-            self._chart_tip_var.set(
+            self._chart_tip_base = (
                 "历史日K：东方财富黄金9999收盘价（2020年至今可查）；隐私模式下买入点位已隐藏。")
         else:
-            self._chart_tip_var.set(
+            self._chart_tip_base = (
                 "金色曲线=东方财富黄金9999日收盘价｜橙点=每笔买入成交价（定位到成交当日，节假日顺延），"
-                "标签自动避让、引线连到买点｜橙色虚线=当前持仓加权平均成本")
+                "标签自动避让、引线连到买点｜橙色虚线=持仓成本｜蓝色虚线=补仓计划价"
+                "（鼠标移动可看任意时点收盘价）")
+        self._chart_pts = [(x_of(i), y_of(r[2]), r[0], r[2])
+                           for i, r in enumerate(kl)]
+        self._chart_tip_var.set(self._chart_tip_base)
 
     # ---------- 本地采集分时（程序运行期间累积，兜底） ----------
     def _draw_local(self, cv, L, R, T, B):
@@ -2891,11 +3062,15 @@ class GoldMonitorApp:
             self._chart_combo.configure(values=days)
             return
 
-        # y 轴范围（纳入昨收基准；历史成本线不纳入，保持走势本身的缩放）
+        # y 轴范围（纳入昨收基准与当日计划价；历史成本线不纳入，保持走势本身的缩放）
         prices = [p for _, p in pts]
         y_lo, y_hi = min(prices), max(prices)
         if base:
             y_lo, y_hi = min(y_lo, base), max(y_hi, base)
+        if is_today and not hidden:
+            for _p in (float(x.get("price") or 0) for x in (self.cfg.get("plans") or [])):
+                if _p > 0:
+                    y_lo, y_hi = min(y_lo, _p), max(y_hi, _p)
         pad = max((y_hi - y_lo) * 0.15, 0.3)
         y_min, y_max = y_lo - pad, y_hi + pad
 
@@ -2924,12 +3099,15 @@ class GoldMonitorApp:
         if is_today and not hidden and self._chart_cost_var.get() \
                 and avg and y_min <= avg <= y_max:
             cost_box = self._avg_cost_line(cv, L, R, y_of, avg)
+        plan_boxes = self._plan_lines(cv, L, R, y_of, y_min, y_max,
+                                      hidden or not is_today)
 
         # 标签统一防碰撞布局（高低点 + 买点）；右轴价签区/成本标签预留避让
         tag_y = y_of(lpv)
         reserve = [(R - 6, tag_y - 12, R + 56, tag_y + 12)]
         if cost_box:
             reserve.append(cost_box)
+        reserve.extend(plan_boxes)
         labels = _ChartLabels(cv, L, R, T, B, reserve=reserve)
         hi_idx = max(range(len(pts)), key=lambda i: pts[i][1])
         lo_idx = min(range(len(pts)), key=lambda i: pts[i][1])
@@ -2969,12 +3147,16 @@ class GoldMonitorApp:
             self._chart_combo.configure(values=days)
 
         if hidden:
-            self._chart_tip_var.set(
+            self._chart_tip_base = (
                 "金色曲线为本地采集的实时赎回价（公开行情）；隐私模式下买入点位与成本线已隐藏。")
         else:
-            self._chart_tip_var.set(
+            self._chart_tip_base = (
                 "金色曲线=本地按分钟采集的赎回价（仅程序运行期间有数据，建议用在线模式）"
-                "｜橙点=当日买入成交价，标签自动避让｜橙色虚线=当前持仓加权平均成本")
+                "｜橙点=当日买入成交价，标签自动避让｜橙色虚线=持仓成本"
+                "｜蓝色虚线=补仓计划价（鼠标移动可看任意时点价格）")
+        self._chart_pts = [(x_of(hm), y_of(p), f"{selected} {hm}", p)
+                           for hm, p in pts]
+        self._chart_tip_var.set(self._chart_tip_base)
 
     def _add_trade(self):
         win = tk.Toplevel(self.root)
@@ -3296,6 +3478,89 @@ class GoldMonitorApp:
         save_settles(self._settles)
         self._settle_recorded_day = day
 
+    # ---- 支付宝口径日结价定时对齐（AUTD 每晚 22:30 五分钟K收盘） ----
+    def _settle_tick(self):
+        """独立于行情轮询的日结价对齐调度（每 5 分钟）：
+        - 启动后回补一次近 14 天缺失日结价（东财分钟K仅保留约 10 个交易日）；
+        - 工作日过 22:35 后对齐当晚新价，K 线尚未生成时失败重试，直到当日对齐成功。"""
+        try:
+            now = datetime.now()
+            today = now.strftime("%Y-%m-%d")
+            need_night = (now.weekday() < 5
+                          and now.strftime("%H:%M") >= SETTLE_SYNC_HM
+                          and self._settle_aligned_day != today)
+            if not self._settle_backfilled or need_night:
+                self._settle_sync(night=need_night)
+        finally:
+            if not self.stop_event.is_set():
+                self.root.after(5 * 60 * 1000, self._settle_tick)
+
+    def _settle_sync(self, night=False):
+        """后台拉取近 14 天 AUTD 22:30 收盘价并合并落盘。
+        规则：填补缺失日期、以支付宝口径覆盖 src=icbc/em 的旧值，
+        绝不覆盖人工 src=alipay 记录。night=True 表示本次为当晚对齐。"""
+        if self._settle_syncing:
+            return
+        self._settle_syncing = True
+        end = datetime.now()
+        beg = (end - timedelta(days=14)).strftime("%Y%m%d")
+        end_s = end.strftime("%Y%m%d")
+        today = end.strftime("%Y-%m-%d")
+
+        def work():
+            data, err = None, None
+            try:
+                data = fetch_autd_settle(beg, end_s)
+            except Exception as e:
+                err = e
+
+            def ui():
+                self._settle_syncing = False
+                if data is None:
+                    # 夜间对齐失败（K线未生成/网络抖动），下个 tick（5 分钟）自动重试
+                    return
+                self._settle_backfilled = True
+                filled, updated = [], []
+                for d, p in data.items():
+                    old = self._settles.get(d)
+                    if old is None:
+                        filled.append(d)
+                    elif old.get("src") == "alipay":
+                        continue  # 人工按支付宝截图录入的精确价，永不覆盖
+                    elif abs(float(old.get("price") or 0) - float(p)) < 1e-9:
+                        continue
+                    else:
+                        updated.append(d)
+                    self._settles[d] = {"price": float(p), "src": "em"}
+                if filled or updated:
+                    self._settles = dict(sorted(self._settles.items()))
+                    save_settles(self._settles)
+                    self._em_cache["settle_em"] = (
+                        {d: float(v["price"])
+                         for d, v in self._settles.items()
+                         if v.get("src") in ("em", "icbc")},
+                        time.time())
+                    self._render_position()
+                    if self._pl_win is not None:
+                        self._refresh_pl_calendar()
+                    if self._chart_win is not None:
+                        mode_var = getattr(self, "_chart_mode_var", None)
+                        if mode_var is not None and \
+                                self.CHART_MODES.get(mode_var.get()) == "local":
+                            self._draw_chart()
+                # 当晚 22:30 K线已出现即视为当日对齐成功；否则留给下个 tick 重试
+                if night and today in data:
+                    self._settle_aligned_day = today
+                    if today in filled or today in updated:
+                        self.toasts.show(
+                            "日结价已对齐支付宝口径",
+                            f"{today} 日结价 {data[today]:.2f} 元/克\n"
+                            "（黄金T+D 22:30 收盘价），每日盈亏按此结算。",
+                            duration_ms=10000, kind="up")
+            self.root.after(0, ui)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _on_data(self, data):
         self.failed_count = 0
         self._online = True
@@ -3368,7 +3633,14 @@ class GoldMonitorApp:
             self._persist()
             bucket = math.floor(price / self.cfg["step"]) * self.cfg["step"]
             self.status_var.set(
-                f"[{ts}] 已建立监控基线 {price:.2f}，跌破 {bucket:.0f} 元档时首次提醒。")
+                f"[{ts}] 已建立监控基线 {price:.2f}，跌破 {bucket:g} 或涨破 {bucket + self.cfg['step']:g} 元档时提醒。")
+            # 计划补仓价同步建基线：高于基线价的计划先标记已触发（不打扰），
+            # 等价格重新站上去后才重新武装；低于基线的计划正常等待下穿
+            plan_base = data.get("jicun_active") or price
+            self._plans_fired = {
+                round(float(p.get("price") or 0), 2): float(p.get("price") or 0) >= plan_base
+                for p in (self.cfg.get("plans") or []) if float(p.get("price") or 0) > 0
+            }
             self._schedule_next()
             return
 
@@ -3385,7 +3657,14 @@ class GoldMonitorApp:
 
         tiers = crossed_tiers(prev, price, step)
         if tiers:
-            self._fire_alerts(price, tiers, data, ts)
+            self._fire_alerts(price, tiers, data, ts, up=False)
+        if self.alert_up_var.get():
+            tiers_up = crossed_tiers_up(prev, price, step)
+            if tiers_up:
+                self._fire_alerts(price, tiers_up, data, ts, up=True)
+
+        # 补仓计划价检测（按主动买入价口径：买到手的价格）
+        self._check_plans(prev, price, data, ts)
 
         self.last_price = price
         self.cfg["last_price"] = price
@@ -3393,34 +3672,230 @@ class GoldMonitorApp:
         self.status_var.set(f"[{ts}] 监控中：当前 {price:.2f}，每 {step:g} 元一档。")
         self._schedule_next()
 
-    def _fire_alerts(self, price, tiers, data, ts):
+    def _check_plans(self, prev, price, data, ts):
+        """补仓计划价检测：按主动买入价口径，严格下穿目标价（prev >= p > price）
+        时提醒一次；价格重新站回目标价上方后自动重新武装。"""
+        plans = self.cfg.get("plans") or []
+        if not plans:
+            return
+        buy = data.get("jicun_active") or price
+        if self._plans_fired is None:
+            self._plans_fired = {}
+        fired = self._plans_fired
+        hits = []
+        for plan in plans:
+            try:
+                target = round(float(plan.get("price") or 0), 2)
+                grams = float(plan.get("grams") or 0)
+            except (TypeError, ValueError):
+                continue
+            if target <= 0:
+                continue
+            was = fired.get(target, False)
+            if not was and prev is not None and prev >= target > buy:
+                hits.append((target, grams))
+                fired[target] = True
+            elif was and buy > target:
+                # 价格涨回目标价上方，重新武装（按买入价成交可能略高于目标，留 0.01 余量）
+                fired[target] = False
+        for target, grams in hits:
+            self._fire_plan_alert(target, grams, buy, ts)
+
+    def _fire_plan_alert(self, target, grams, buy, ts):
+        if grams > 0:
+            amount = target * grams
+            g_txt = f"按计划补 {grams:g} 克，约 {amount:,.0f} 元"
+        else:
+            g_txt = "到计划目标价了，可以看看补多少"
+        title = f"补仓计划到价 {target:g} 元"
+        msg = (f"[{ts}] 主动买入价已下穿计划价\n"
+               f"当前买入 {buy:.2f} 元/克\n{g_txt}")
+        self.toasts.show(title, msg, tag=f"plan-{target:g}",
+                         duration_ms=30000, kind="plan")
+        self.status_var.set(msg.replace("\n", " "))
+        if self.sound_var.get():
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            except Exception:
+                self.root.bell()
+        if self.tray is not None:
+            try:
+                self.tray.title = f"{APP_NAME}｜补仓计划 {target:g} 元到价"
+                self.tray.notify(g_txt, title)
+            except Exception:
+                pass
+
+    def _open_plans(self):
+        """补仓计划管理窗：目标买入价 + 计划克数，走势图同步画蓝色虚线。"""
+        win = getattr(self, "_plans_win", None)
+        if win is not None and tk.Toplevel.winfo_exists(win):
+            win.lift()
+            win.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("补仓计划价")
+        win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
+        win.geometry("440x460")
+        win.minsize(400, 380)
+        win.configure(bg=C_BG)
+        win.transient(self.root)
+
+        tk.Label(win, text="补仓计划价", bg=C_BG, fg=C_GOLD_HI,
+                 font=(FONT, 12, "bold")).pack(anchor="w", padx=16, pady=(14, 2))
+        tip = ("买入价下穿目标价时弹窗提醒；走势图上以蓝色虚线标记。\n"
+               "可先定目标价、克数留 0（只提醒），或直接定好补多少克。")
+        tk.Label(win, text=tip, bg=C_BG, fg=C_TXT_2,
+                 font=(FONT, 8), justify="left").pack(anchor="w", padx=16)
+
+        form = tk.Frame(win, bg=C_BG)
+        form.pack(fill="x", padx=16, pady=10)
+        tk.Label(form, text="目标价", bg=C_BG, fg=C_TXT,
+                 font=(FONT, 9)).grid(row=0, column=0, sticky="e", padx=(0, 6), pady=4)
+        price_entry = ttk.Entry(form, width=12)
+        price_entry.grid(row=0, column=1, pady=4)
+        tk.Label(form, text="元/克", bg=C_BG, fg=C_TXT_2,
+                 font=(FONT, 8)).grid(row=0, column=2, sticky="w", padx=4)
+        tk.Label(form, text="计划克数", bg=C_BG, fg=C_TXT,
+                 font=(FONT, 9)).grid(row=0, column=3, sticky="e", padx=(16, 6))
+        grams_entry = ttk.Entry(form, width=12)
+        grams_entry.grid(row=0, column=4, pady=4)
+
+        cols = ("price", "grams", "amount")
+        headers = ("目标价(元/克)", "计划克数(克)", "预计金额(元)")
+        widths = (130, 120, 120)
+        frame = tk.Frame(win, bg=C_CARD, highlightbackground=C_LINE, highlightthickness=1)
+        frame.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+        tree = ttk.Treeview(frame, columns=cols, show="headings", height=8, selectmode="browse")
+        for c, h, w in zip(cols, headers, widths):
+            tree.heading(c, text=h)
+            tree.column(c, width=w, anchor="e")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        tree.tag_configure("plan", foreground=C_PLAN)
+        self._plans_tree = tree
+
+        def add_plan(_=None):
+            try:
+                p = float(price_entry.get().strip())
+                g = float(grams_entry.get().strip() or 0)
+            except ValueError:
+                messagebox.showwarning("格式不对", "目标价和克数需要是数字。", parent=win)
+                return
+            if p <= 0 or g < 0:
+                messagebox.showwarning("格式不对", "目标价需大于 0，克数不能为负。", parent=win)
+                return
+            plans = self.cfg.get("plans") or []
+            key = round(p, 2)
+            plans = [x for x in plans if round(float(x.get("price") or 0), 2) != key]
+            plans.append({"price": key, "grams": g})
+            plans.sort(key=lambda x: float(x.get("price") or 0), reverse=True)
+            self.cfg["plans"] = plans
+            self._persist()
+            # 新计划：当前买入价在其下方时先标记已触发，不打扰
+            buy = self._latest_data.get("jicun_active") if self._latest_data else None
+            cur = buy or self.last_price
+            if self._plans_fired is None:
+                self._plans_fired = {}
+            if cur is not None:
+                self._plans_fired[key] = cur <= key
+            price_entry.delete(0, "end")
+            grams_entry.delete(0, "end")
+            price_entry.focus_set()
+            self._refresh_plans()
+            if self._chart_win is not None:
+                self._draw_chart()
+
+        def del_plan():
+            sel = tree.selection()
+            if not sel:
+                return
+            key = float(sel[0])
+            plans = [x for x in (self.cfg.get("plans") or [])
+                     if round(float(x.get("price") or 0), 2) != round(key, 2)]
+            self.cfg["plans"] = plans
+            self._persist()
+            if self._plans_fired is not None:
+                self._plans_fired.pop(round(key, 2), None)
+            self._refresh_plans()
+            if self._chart_win is not None:
+                self._draw_chart()
+
+        price_entry.bind("<Return>", add_plan)
+        grams_entry.bind("<Return>", add_plan)
+        btns = tk.Frame(win, bg=C_BG)
+        btns.pack(fill="x", padx=16, pady=(0, 14))
+        ttk.Button(btns, text="添加计划", style="Gold.TButton",
+                   command=add_plan).pack(side="left")
+        ttk.Button(btns, text="删除选中", command=del_plan).pack(side="left", padx=8)
+        ttk.Button(btns, text="关闭", command=lambda: self._close_plans(win)).pack(side="right")
+
+        self._plans_win = win
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_plans(win))
+        self._refresh_plans()
+
+    def _refresh_plans(self):
+        win = getattr(self, "_plans_win", None)
+        tree = getattr(self, "_plans_tree", None)
+        if win is None or not tk.Toplevel.winfo_exists(win) or tree is None:
+            return
+        tree.delete(*tree.get_children())
+        for i, p in enumerate(self.cfg.get("plans") or []):
+            px = float(p.get("price") or 0)
+            g = float(p.get("grams") or 0)
+            amt = f"{px * g:,.0f}" if g > 0 else "只提醒"
+            tree.insert("", "end", iid=f"{px:g}",
+                        values=(f"{px:g}", f"{g:g}" if g > 0 else "--", amt),
+                        tags=("plan",))
+
+    def _close_plans(self, win):
+        self._plans_win = None
+        self._plans_tree = None
+        win.destroy()
+
+    def _fire_alerts(self, price, tiers, data, ts, up=False):
         name = SOURCES[self.cfg["source"]]["name"]
         unit = SOURCES[self.cfg["source"]]["unit"]
         # 一次轮询可能跨多档：合并为一条弹窗，逐档列示
-        lines = "\n".join(f"跌破 {t:g} 元" for t in tiers)
+        verb = "涨破" if up else "跌破"
+        lines = "\n".join(f"{verb} {t:g} 元" for t in tiers)
         msg = f"当前 {price:.2f} {unit}\n{lines}"
         # 附带持仓实时浮盈（按赎回价）
         sell = self._latest_sell
         grams = float(self.cfg.get("hold_grams") or 0)
         cost = float(self.cfg.get("hold_cost") or 0)
+        avg_cost = cost / grams if grams else 0.0
         pl_txt = ""
         if self.cfg.get("privacy"):
             pl_txt = "\n持仓浮盈 ****（** 克）"
         elif sell and grams > 0 and cost > 0:
             pl = grams * sell - cost
             pl_txt = f"\n持仓浮盈 {pl:+,.2f} 元（{grams:g} 克）"
-        self.toasts.show("金价跳水现场，注意仓位", f"{name}\n{msg}{pl_txt}", duration_ms=15000)
+        if up:
+            # 回本检测：从成本下方穿过成本均价
+            if avg_cost and self.last_price is not None and self.last_price < avg_cost <= price:
+                title = "回本啦！可以考虑减仓"
+                msg += f"\n已站回持仓成本 {avg_cost:.2f} 元/克，熬出头了"
+            else:
+                title = "金价拉升，吃肉现场"
+            self.toasts.show(title, f"{name}\n{msg}{pl_txt}", duration_ms=15000, kind="up")
+        else:
+            self.toasts.show("金价跳水现场，注意仓位", f"{name}\n{msg}{pl_txt}",
+                             duration_ms=15000, kind="down")
         if self.sound_var.get():
             try:
                 import winsound
-                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION if not up
+                                     else winsound.MB_ICONASTERISK)
             except Exception:
                 self.root.bell()
 
         # 更新托盘 tooltip
         if self.tray:
             try:
-                tip = f"{APP_NAME}｜{price:.2f}（跌破 {tiers[0]:g}）"
+                tip = f"{APP_NAME}｜{price:.2f}（{verb} {tiers[0]:g}）"
                 if self.cfg.get("privacy"):
                     tip += "｜浮盈 ****"
                 elif sell and grams > 0 and cost > 0:
@@ -3455,6 +3930,8 @@ class GoldMonitorApp:
 
     def _persist(self):
         self.cfg["sound"] = bool(self.sound_var.get())
+        if hasattr(self, "alert_up_var"):
+            self.cfg["alert_up"] = bool(self.alert_up_var.get())
         save_config(self.cfg)
 
     def run(self):
@@ -3480,9 +3957,65 @@ def _cli_test():
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def log_error(where, exc_info):
+    """把异常追加写入 error.log；文件过大时滚动保留后半段，避免无限增长。"""
+    try:
+        tb = "".join(traceback.format_exception(*exc_info))
+        block = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {where}\n{tb}\n"
+        if os.path.exists(ERROR_PATH) and os.path.getsize(ERROR_PATH) > ERROR_LOG_MAX:
+            try:
+                with open(ERROR_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                    old = f.read()
+                with open(ERROR_PATH, "w", encoding="utf-8") as f:
+                    f.write(old[-ERROR_LOG_MAX // 2:])
+            except OSError:
+                pass
+        with open(ERROR_PATH, "a", encoding="utf-8") as f:
+            f.write(block)
+    except Exception:
+        pass  # 日志本身绝不能再抛出
+
+
+def _install_excepthook():
+    """主线程 / 后台线程未捕获异常统一落盘；主线程致命错误额外弹窗提示。"""
+    def on_main(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        log_error("主线程未捕获异常", (exc_type, exc, tb))
+        try:
+            messagebox.showerror(
+                APP_NAME,
+                f"程序遇到错误：{exc_type.__name__}: {exc}\n\n"
+                f"详细信息已写入：\n{ERROR_PATH}")
+        except Exception:
+            pass
+
+    def on_thread(args):
+        log_error(f"后台线程未捕获异常（{args.thread.name if args.thread else '?'}）",
+                  (args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = on_main
+    threading.excepthook = on_thread
+    # Tk 的 after / 事件回调异常默认只打印到控制台（windowed 下等于消失），单独接管
+    tk.Tk.report_callback_exception = lambda self_, exc, val, tb: log_error(
+        "界面回调未捕获异常", (exc, val, tb))
+
+
 if __name__ == "__main__":
     if "--check" in sys.argv:
         _cli_test()
     else:
         _enable_dpi()
-        GoldMonitorApp().run()
+        _install_excepthook()
+        try:
+            GoldMonitorApp().run()
+        except Exception:
+            log_error("启动/运行失败", sys.exc_info())
+            try:
+                messagebox.showerror(
+                    APP_NAME,
+                    f"程序启动失败：\n{traceback.format_exc(limit=3)}\n\n"
+                    f"详细信息已写入：\n{ERROR_PATH}")
+            except Exception:
+                raise
