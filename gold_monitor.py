@@ -25,7 +25,6 @@ import webbrowser
 from datetime import datetime, timedelta
 
 import tkinter as tk
-import tkinter.font as tkfont
 from tkinter import ttk, messagebox
 
 # ---------- 全局常量 ----------
@@ -66,13 +65,13 @@ EM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebK
 EM_TRENDS_TTL = 60     # 分时缓存秒数（交易时段内 1 分钟刷新一次即可）
 EM_KLINE_TTL = 1800    # 日K缓存秒数
 
-# 底部跑马灯：百度热搜·财经榜（免鉴权公开接口），按榜单排名/热度展示
+# 财经热搜弹窗：百度热搜·财经榜（免鉴权公开接口），按榜单排名/热度展示
 BAIDU_FIN_URL = "https://top.baidu.com/api/board?platform=pc&tab=finance"
 NEWS_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                               "AppleWebKit/537.36 Chrome/120 Safari/537.36",
                 "Referer": "https://top.baidu.com/board?tab=finance"}
 NEWS_REFRESH_SEC = 600   # 热榜刷新间隔（10 分钟，榜单本身更新不频繁）
-NEWS_TOP_N = 15          # 跑马灯滚动前 N 条（完整榜单可点开看全部 30 条）
+WIN_W = 470              # 主窗口固定宽（轻奢米金版加宽，留白更舒展）
 
 
 # 工行老站点使用旧版 TLS 重协商，OpenSSL 3 默认拒绝，需要显式放开
@@ -117,8 +116,7 @@ DEFAULT_CONFIG = {
     # 补仓计划：[{"price": 目标买入价, "grams": 计划克数}]，
     # 买入价下穿目标价时弹窗提醒按计划补仓，走势图上以蓝色虚线标记
     "plans": [],
-    "theme": "dark",            # 界面主题：dark（黑金暗色）/ light（浅色日间）
-    "news_bar": True,           # 底部财经热搜跑马灯（百度热搜·财经榜）
+    "theme": "light",           # 界面主题：light（轻奢米金·昼，主打）/ dark（轻奢米金·夜）
     "settings_open": False,     # 监控设置卡片是否展开（默认折叠，窗口更短）
 }
 
@@ -130,82 +128,84 @@ REDEEM_FEE_RATE = 0.005
 # 每个主题给出同一套语义色键；模块级 C_* 是当前主题的全局别名，
 # 切主题时 apply_theme() 统一刷新，业务代码全部引用 C_* 即可。
 THEMES = {
+    # 轻奢米金·夜：暖墨底色 + 香槟金，去掉生硬描边，靠背景深浅分层
     "dark": {
-        "C_BG":       "#0f1014",   # 窗口底色（深炭黑）
-        "C_CARD":     "#191b21",   # 卡片底色
-        "C_CARD_2":   "#23262f",   # 输入框/次级控件底色
-        "C_LINE":     "#2e313b",   # 描边/分隔线
-        "C_GOLD":     "#c9a04e",   # 主金色（描边/次级强调）
-        "C_GOLD_HI":  "#f6dfa0",   # 高亮金（大数字/标题）
-        "C_GOLD_DIM": "#9c7f3a",   # 暗金（弱提示/选中底）
-        "C_TXT":      "#ece8dd",   # 主文字（暖白）
-        "C_TXT_2":    "#9b968a",   # 次要文字
-        "C_TXT_3":    "#6f6b61",   # 弱化文字
-        "C_UP":       "#ff6259",   # 涨/盈利（中国习惯红）
-        "C_DOWN":     "#35cc8e",   # 跌/亏损（亮绿）
-        "C_CHART":    "#14151b",   # 走势图画布底色
-        "C_UP_BG":    "#2e1518",   # 涨徽章底色
-        "C_DOWN_BG":  "#112920",   # 跌徽章底色
-        "C_ROAST_GOLD_BG": "#221d12",
-        "C_ROAST_UP_BG":   "#2a1718",
-        "C_ROAST_DN_BG":   "#12241c",
-        # 金底/红底按钮上的压字色
-        "C_ON_GOLD":  "#17120a",
-        "C_ON_UP":    "#17120a",
+        "C_BG":       "#161310",   # 窗口底色（暖墨）
+        "C_CARD":     "#201c17",   # 卡片底色（略亮暖咖）
+        "C_CARD_2":   "#2a251e",   # 输入框/次级控件底色
+        "C_LINE":     "#383128",   # 分隔线（柔，弱对比）
+        "C_GOLD":     "#d4af6a",   # 主金色（香槟金）
+        "C_GOLD_HI":  "#f3ddaa",   # 高亮金（大数字/标题）
+        "C_GOLD_DIM": "#a9854a",   # 暗金（弱提示/选中底）
+        "C_TXT":      "#f2ece0",   # 主文字（暖白）
+        "C_TXT_2":    "#b3a894",   # 次要文字
+        "C_TXT_3":    "#7d7362",   # 弱化文字
+        "C_UP":       "#f26a5c",   # 涨/盈利（珊瑚红）
+        "C_DOWN":     "#34c98c",   # 跌/亏损（翡翠绿）
+        "C_CHART":    "#1b1814",   # 走势图画布底色
+        "C_UP_BG":    "#3a211d",   # 涨徽章底色
+        "C_DOWN_BG":  "#163026",   # 跌徽章底色
+        "C_ROAST_GOLD_BG": "#2c2417",
+        "C_ROAST_UP_BG":   "#36201d",
+        "C_ROAST_DN_BG":   "#152c24",
+        # 金底按钮上的压字色
+        "C_ON_GOLD":  "#221a0c",
+        "C_ON_UP":    "#221a0c",
         # 控件悬停/按下
-        "C_HOVER":    "#2d313c",
-        "C_ACTIVE":   "#3a4050",
-        "C_PRESSED":  "#333845",
-        "C_SEL":      "#3d3522",   # 列表选中底
+        "C_HOVER":    "#322b22",
+        "C_ACTIVE":   "#3f372c",
+        "C_PRESSED":  "#382f25",
+        "C_SEL":      "#4a3c22",   # 列表选中底
         # Canvas 走势图
-        "C_GRID":     "#22242c",
-        "C_GRID_AX":  "#262830",
-        "C_AREA":     "#241f14",
-        "C_REF_DASH": "#4a4d58",
-        "C_BASE_BG":  "#241f12",   # 补仓基准行底色
-        "C_TOTAL_BG": "#20242f",   # 合计行底色
-        "C_ICON_DISK": "#191b21",  # 应用图标盘心色
-        "C_COST":     "#ffb36b",   # 持仓成本线标注（橙）
-        "C_COST_LINE": "#e8924a",  # 持仓成本虚线
-        "C_PLAN":     "#7fb6ff",   # 补仓计划价标注（蓝）
-        "C_PLAN_LINE": "#5a93e8",  # 补仓计划虚线
+        "C_GRID":     "#2a251e",
+        "C_GRID_AX":  "#332c23",
+        "C_AREA":     "#33281a",
+        "C_REF_DASH": "#5a5142",
+        "C_BASE_BG":  "#2e2618",   # 补仓基准行底色
+        "C_TOTAL_BG": "#282218",   # 合计行底色
+        "C_ICON_DISK": "#201c17",  # 应用图标盘心色
+        "C_COST":     "#f0b368",   # 持仓成本线标注（琥珀）
+        "C_COST_LINE": "#df9a4c",  # 持仓成本虚线
+        "C_PLAN":     "#8ab4ef",   # 补仓计划价标注（雾蓝）
+        "C_PLAN_LINE": "#6a97d8",  # 补仓计划虚线
     },
+    # 轻奢米金·昼（主打）：奶白卡面 + 墨金标题 + 翡绿/朱红，大量留白
     "light": {
-        "C_BG":       "#f4f1ea",   # 窗口底色（暖米白）
-        "C_CARD":     "#ffffff",   # 卡片白
-        "C_CARD_2":   "#f0ede5",   # 输入框/次级控件
-        "C_LINE":     "#e0dccf",   # 描边/分隔线
-        "C_GOLD":     "#b08a2e",   # 主金色（浅底下压深，保证可读）
-        "C_GOLD_HI":  "#8a6512",   # 大数字深金
-        "C_GOLD_DIM": "#c9a85a",   # 暗金
-        "C_TXT":      "#2b2620",   # 主文字（暖墨黑）
-        "C_TXT_2":    "#6d675c",   # 次要文字
-        "C_TXT_3":    "#9b9487",   # 弱化文字
-        "C_UP":       "#e5483d",   # 红涨（浅底下加深）
-        "C_DOWN":     "#129a63",   # 绿跌（加深）
-        "C_CHART":    "#fbfaf7",
-        "C_UP_BG":    "#fdecea",
-        "C_DOWN_BG":  "#e3f6ec",
-        "C_ROAST_GOLD_BG": "#faf3e0",
-        "C_ROAST_UP_BG":   "#fdecea",
-        "C_ROAST_DN_BG":   "#e3f6ec",
-        "C_ON_GOLD":  "#ffffff",
-        "C_ON_UP":    "#ffffff",
-        "C_HOVER":    "#e6e1d4",
-        "C_ACTIVE":   "#ddd7c8",
-        "C_PRESSED":  "#d3ccba",
-        "C_SEL":      "#efe3c2",
-        "C_GRID":     "#e7e2d6",
-        "C_GRID_AX":  "#dcd5c5",
-        "C_AREA":     "#f3e6c4",
-        "C_REF_DASH": "#b9b19e",
-        "C_BASE_BG":  "#f5ecd4",
-        "C_TOTAL_BG": "#eceadf",
-        "C_ICON_DISK": "#ffffff",
-        "C_COST":     "#b8651a",
-        "C_COST_LINE": "#c07a26",
-        "C_PLAN":     "#2f6fd0",
-        "C_PLAN_LINE": "#2f6fd0",
+        "C_BG":       "#f6f1e7",   # 窗口底色（奶油象牙）
+        "C_CARD":     "#fffdf8",   # 卡片白（微暖）
+        "C_CARD_2":   "#f1ebe0",   # 输入框/次级控件（米色）
+        "C_LINE":     "#e7ddcb",   # 分隔线（柔金米）
+        "C_GOLD":     "#a87d2f",   # 主金色（古铜金，浅底下压深可读）
+        "C_GOLD_HI":  "#7c5a17",   # 大数字墨金
+        "C_GOLD_DIM": "#c7a866",   # 暗金/香槟
+        "C_TXT":      "#33291d",   # 主文字（暖墨褐）
+        "C_TXT_2":    "#7c6f5b",   # 次要文字
+        "C_TXT_3":    "#a99d88",   # 弱化文字
+        "C_UP":       "#d8483a",   # 涨/盈利（朱红）
+        "C_DOWN":     "#0f9d6d",   # 跌/亏损（翡绿）
+        "C_CHART":    "#fdfbf6",
+        "C_UP_BG":    "#fbe9e5",
+        "C_DOWN_BG":  "#e0f4eb",
+        "C_ROAST_GOLD_BG": "#faf1dd",
+        "C_ROAST_UP_BG":   "#fbe9e5",
+        "C_ROAST_DN_BG":   "#e0f4eb",
+        "C_ON_GOLD":  "#fffdf8",
+        "C_ON_UP":    "#fffdf8",
+        "C_HOVER":    "#f0e7d4",
+        "C_ACTIVE":   "#e8ddc6",
+        "C_PRESSED":  "#e0d3b8",
+        "C_SEL":      "#f2e4c4",
+        "C_GRID":     "#eee6d6",
+        "C_GRID_AX":  "#e4dac6",
+        "C_AREA":     "#f5e9cd",
+        "C_REF_DASH": "#c3b59a",
+        "C_BASE_BG":  "#f6ecd2",
+        "C_TOTAL_BG": "#f2ecdf",
+        "C_ICON_DISK": "#fffdf8",
+        "C_COST":     "#b5701c",
+        "C_COST_LINE": "#c2812a",
+        "C_PLAN":     "#2f6fbf",
+        "C_PLAN_LINE": "#2f6fbf",
     },
 }
 
@@ -384,15 +384,16 @@ def apply_dark_style(root):
                     bordercolor=C_LINE, focuscolor="", lightcolor=C_LINE,
                     darkcolor=C_LINE)
     style.configure("TFrame", background=C_BG)
-    style.configure("TButton", padding=(14, 7), background=C_CARD_2,
+    style.configure("TButton", padding=(16, 8), background=C_CARD_2,
                     foreground=C_TXT, bordercolor=C_LINE, focusthickness=0,
                     font=(FONT, 9))
     style.map("TButton",
-              background=[("active", C_ACTIVE), ("pressed", C_PRESSED)],
+              background=[("active", C_HOVER), ("pressed", C_PRESSED)],
               foreground=[("active", C_GOLD_HI)])
     style.configure("Gold.TButton", background=C_GOLD, foreground=C_ON_GOLD,
-                    bordercolor=C_GOLD, font=(FONT, 9, "bold"), padding=(14, 7))
-    style.map("Gold.TButton", background=[("active", C_GOLD_HI)],
+                    bordercolor=C_GOLD, font=(FONT, 9, "bold"), padding=(16, 8))
+    style.map("Gold.TButton", background=[("active", C_GOLD_HI),
+                                          ("pressed", C_GOLD_DIM)],
               foreground=[("active", C_ON_GOLD)])
     style.configure("TEntry", fieldbackground=C_CARD_2, foreground=C_TXT,
                     insertcolor=C_TXT, bordercolor=C_LINE, padding=3)
@@ -720,6 +721,9 @@ def fetch_finance_hot():
             "word": word,
             "url": r.get("rawUrl") or r.get("url") or "",
             "hot": r.get("hotScore") or 0,
+            "desc": (r.get("desc") or "").strip(),       # 一句话简介（财经榜通常为空）
+            "change": str(r.get("hotChange", "")).strip().lower(),  # up / down / same
+            "tag": str(r.get("hotTag", "")).strip(),     # "1" 新 / "3" 沸 / "0" 无
         })
     items.sort(key=lambda x: x["rank"])
     return items
@@ -1241,7 +1245,7 @@ class GoldMonitorApp:
         apply_theme(self.cfg.get("theme", "dark"))
         self.root = tk.Tk()
         self.root.title(APP_NAME)
-        self.root.geometry("420x700")
+        self.root.geometry("%dx700" % WIN_W)
         self.root.configure(bg=C_BG)
         self._icon = _make_icon_photo()
         if self._icon is not None:
@@ -1280,16 +1284,12 @@ class GoldMonitorApp:
         self._em_loading = set()  # 正在后台拉取的 key，避免重复请求
         self._chart_seq = 0  # 走势图绘制代际令牌，丢弃切模式前在途的在线回调
 
-        # 底部财经热搜跑马灯
-        self._news_items = []      # [{"rank","word","url","hot"}] 排名升序
-        self._news_x = 0           # 跑马灯当前 x 偏移
-        self._news_text_w = 0      # 滚动文本总宽
-        self._news_paused = False  # 鼠标悬停暂停
+        # 财经热搜弹窗（默认不主动拉取，打开弹窗才加载）
+        self._news_items = []      # [{"rank","word","url","hot",...}] 排名升序
         self._news_loading = False
-        self._news_loaded_once = False
-        self._news_font = tkfont.Font(family=FONT, size=9)
         self._news_list_win = None
-        self._news_gen = 0       # 跑马灯代际：UI 重建后旧定时链自行作废
+        self._news_last_fetch = 0.0  # 上次成功拉取时间戳（弹窗内节流）
+        self._news_last_ok = ""      # 上次成功拉取的 "HH:MM"（弹窗副标题展示）
 
         self._build_ui()
         self._fit_window()
@@ -1303,13 +1303,13 @@ class GoldMonitorApp:
 
     # ---- UI ----
     def _fit_window(self):
-        """窗口高度贴合内容并夹取到屏幕工作区内居中：固定宽 420，高随内容自适应，
+        """窗口高度贴合内容并夹取到屏幕工作区内居中：固定宽 WIN_W，高随内容自适应，
         避免在低分辨率 / 高 DPI 下底部被裁切或留白。
         注意：tk geometry 的宽高即客户区宽高（外框标题栏由系统额外叠加），
         所以高度直接取 winfo_reqheight，不要再加标题栏高度。"""
         root = self.root
         root.update_idletasks()
-        w = 420
+        w = WIN_W
         content_h = root.winfo_reqheight()
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         h = min(content_h, sh - 64)          # 64 给标题栏 + 边距余量
@@ -1336,16 +1336,16 @@ class GoldMonitorApp:
         self.body = body
 
         # 顶部：深底金线 + 实时呼吸点，不搞大红大紫，主打一个低调搞钱
-        header = tk.Frame(body, bg=C_BG, height=64)
+        header = tk.Frame(body, bg=C_BG, height=68)
         header.pack(fill="x")
         header.pack_propagate(False)
         tk.Frame(header, bg=C_GOLD, height=2).pack(fill="x", side="top")
         hin = tk.Frame(header, bg=C_BG)
         hin.pack(fill="both", expand=True, padx=PAD)
         title_row = tk.Frame(hin, bg=C_BG)
-        title_row.pack(fill="x", pady=(8, 0))
+        title_row.pack(fill="x", pady=(10, 0))
         tk.Label(title_row, text="金价盯盘小助手", bg=C_BG, fg=C_GOLD_HI,
-                 font=(FONT, 15, "bold")).pack(side="left")
+                 font=(FONT, 16, "bold")).pack(side="left")
         # 日/夜主题切换
         self.theme_btn = tk.Button(
             title_row, text=("☀ 浅色" if THEME_NAME == "dark" else "☾ 暗色"),
@@ -1365,10 +1365,10 @@ class GoldMonitorApp:
         # ---- 价格卡 ----
         card = tk.Frame(body, bg=C_CARD, highlightbackground=C_LINE,
                         highlightthickness=1)
-        card.pack(fill="x", padx=PAD, pady=(2, 8))
+        card.pack(fill="x", padx=PAD, pady=(4, 10))
 
         toprow = tk.Frame(card, bg=C_CARD)
-        toprow.pack(fill="x", padx=16, pady=(12, 0))
+        toprow.pack(fill="x", padx=18, pady=(14, 0))
         self.name_var = tk.StringVar(value=SOURCES[self.cfg["source"]]["name"])
         tk.Label(toprow, textvariable=self.name_var, bg=C_CARD, fg=C_TXT_2,
                 font=(FONT, 9)).pack(side="left")
@@ -1380,18 +1380,18 @@ class GoldMonitorApp:
         self.chg_label.pack(side="right")
 
         prow = tk.Frame(card, bg=C_CARD)
-        prow.pack(fill="x", padx=14, pady=(2, 0))
+        prow.pack(fill="x", padx=16, pady=(4, 0))
         self.price_var = tk.StringVar(value="--")
         self.price_label = tk.Label(prow, textvariable=self.price_var, bg=C_CARD,
                                     fg=C_GOLD_HI,
-                                    font=(FONT, 30, "bold"))
+                                    font=(FONT, 34, "bold"))
         self.price_label.pack(side="left")
         tk.Label(prow, text="元/克", bg=C_CARD, fg=C_TXT_3,
-                 font=(FONT, 9)).pack(side="left", anchor="s", pady=(0, 5),
-                                       padx=(2, 0))
+                 font=(FONT, 9)).pack(side="left", anchor="s", pady=(0, 6),
+                                       padx=(3, 0))
 
         meta = tk.Frame(card, bg=C_CARD)
-        meta.pack(fill="x", padx=16, pady=(3, 12))
+        meta.pack(fill="x", padx=18, pady=(5, 14))
         self.hl_var = tk.StringVar(value="最高 --")
         self.ll_var = tk.StringVar(value="最低 --")
         tk.Label(meta, textvariable=self.hl_var, bg=C_CARD, fg=C_TXT_2,
@@ -1402,14 +1402,14 @@ class GoldMonitorApp:
         # ---- 小金库（按积存金赎回价估值）----
         pos = tk.Frame(body, bg=C_CARD, highlightbackground=C_LINE,
                        highlightthickness=1)
-        pos.pack(fill="x", padx=PAD)
+        pos.pack(fill="x", padx=PAD, pady=(0, 10))
 
         pos_head = tk.Frame(pos, bg=C_CARD)
-        pos_head.pack(fill="x", padx=16, pady=(11, 0))
-        tk.Frame(pos_head, bg=C_GOLD, width=3, height=13).pack(side="left", padx=(0, 7))
+        pos_head.pack(fill="x", padx=18, pady=(13, 0))
+        tk.Frame(pos_head, bg=C_GOLD, width=3, height=14).pack(side="left", padx=(0, 8))
         tk.Label(pos_head, text="我的小金库",
                  bg=C_CARD, fg=C_TXT,
-                 font=(FONT, 10, "bold")).pack(side="left")
+                 font=(FONT, 11, "bold")).pack(side="left")
         self.privacy_btn = tk.Button(
             pos_head, text=("👁 打码" if not self.cfg.get("privacy") else "🙈 亮牌"),
             font=(FONT, 8), fg=C_GOLD, bg=C_CARD, bd=0,
@@ -1423,14 +1423,17 @@ class GoldMonitorApp:
         for i in range(3):
             tools.grid_columnconfigure(i, weight=1, uniform="tool")
 
-        def tool_btn(r, c, text, cmd):
-            b = tk.Button(tools, text=text, font=(FONT, 9), fg=C_TXT,
-                          bg=C_CARD_2, bd=0, cursor="hand2",
-                          activebackground=C_ACTIVE, activeforeground=C_GOLD_HI,
-                          relief="flat", padx=4, pady=5, command=cmd)
-            b.grid(row=r, column=c, sticky="ew", padx=3, pady=3)
-            b.bind("<Enter>", lambda _=None, w=b: w.configure(bg=C_HOVER))
-            b.bind("<Leave>", lambda _=None, w=b: w.configure(bg=C_CARD_2))
+        def tool_btn(r, c, text, cmd, cspan=1, accent=False):
+            b = tk.Button(tools, text=text, font=(FONT, 9, "bold" if accent else "normal"),
+                          fg=C_ON_GOLD if accent else C_TXT,
+                          bg=C_GOLD if accent else C_CARD_2, bd=0, cursor="hand2",
+                          activebackground=C_GOLD_HI if accent else C_ACTIVE,
+                          activeforeground=C_ON_GOLD if accent else C_GOLD_HI,
+                          relief="flat", padx=4, pady=7, command=cmd)
+            b.grid(row=r, column=c, columnspan=cspan, sticky="ew", padx=3, pady=3)
+            if not accent:
+                b.bind("<Enter>", lambda _=None, w=b: w.configure(bg=C_HOVER))
+                b.bind("<Leave>", lambda _=None, w=b: w.configure(bg=C_CARD_2))
             return b
 
         tool_btn(0, 0, "编辑持仓", self._edit_position)
@@ -1439,18 +1442,19 @@ class GoldMonitorApp:
         tool_btn(1, 0, "战绩", self._open_trades)
         tool_btn(1, 1, "韭历", self._open_pl_calendar)
         tool_btn(1, 2, "走势图", self._open_chart)
+        tool_btn(2, 0, "财经热搜", self._open_news_list, cspan=3, accent=True)
 
         # 市值：小标签在上，大数字在下，层级清晰
         tk.Label(pos, text="实时市值", bg=C_CARD, fg=C_TXT_2,
-                 font=(FONT, 9)).pack(anchor="w", padx=16, pady=(9, 0))
+                 font=(FONT, 9)).pack(anchor="w", padx=18, pady=(12, 0))
         mv_row = tk.Frame(pos, bg=C_CARD)
-        mv_row.pack(fill="x", padx=14)
+        mv_row.pack(fill="x", padx=16)
         self.pos_mv_var = tk.StringVar(value="--")
         self.pos_mv_label = tk.Label(mv_row, textvariable=self.pos_mv_var, bg=C_CARD,
-                                     fg=C_TXT, font=(FONT, 20, "bold"))
+                                     fg=C_TXT, font=(FONT, 22, "bold"))
         self.pos_mv_label.pack(side="left")
         tk.Label(mv_row, text="元", bg=C_CARD, fg=C_TXT_2,
-                 font=(FONT, 10)).pack(side="left", padx=(4, 0), pady=(0, 2),
+                 font=(FONT, 10)).pack(side="left", padx=(4, 0), pady=(0, 3),
                                         anchor="s")
 
         # 持有收益（值单独上色）
@@ -1489,22 +1493,22 @@ class GoldMonitorApp:
         self.roast_var = tk.StringVar(value="")
         self.roast_label = tk.Label(roast_bar, textvariable=self.roast_var,
                                     bg=C_ROAST_GOLD_BG, fg=C_GOLD_HI,
-                                    font=(FONT, 9), wraplength=328,
+                                    font=(FONT, 9), wraplength=378,
                                     justify="left", anchor="w")
-        self.roast_label.pack(side="left", fill="x", expand=True, padx=10, pady=6)
+        self.roast_label.pack(side="left", fill="x", expand=True, padx=12, pady=7)
 
         self.pos_info_var = tk.StringVar(value="")
         tk.Label(pos, textvariable=self.pos_info_var, bg=C_CARD, fg=C_TXT_3,
-                 font=(FONT, 8), wraplength=352, justify="left").pack(
-            anchor="w", padx=16, pady=(6, 11))
+                 font=(FONT, 8), wraplength=402, justify="left").pack(
+            anchor="w", padx=18, pady=(7, 13))
 
         # ---- 监控设置 ----
         box = tk.Frame(body, bg=C_CARD, highlightbackground=C_LINE,
                        highlightthickness=1)
-        box.pack(fill="x", padx=PAD, pady=8)
+        box.pack(fill="x", padx=PAD, pady=(0, 10))
 
         bhead = tk.Frame(box, bg=C_CARD, cursor="hand2")
-        bhead.pack(fill="x", padx=16, pady=(11, 6))
+        bhead.pack(fill="x", padx=18, pady=(13, 7))
         self._settings_arrow_var = tk.StringVar(
             value="▾" if self.cfg.get("settings_open", False) else "▸")
         tk.Label(bhead, textvariable=self._settings_arrow_var, bg=C_CARD,
@@ -1567,54 +1571,22 @@ class GoldMonitorApp:
         self.autostart_var = tk.BooleanVar(value=self.cfg["autostart"])
         dark_checkbutton(checks, "开机自动启动（一起床就看盘）", self.autostart_var,
                          bg=C_CARD, command=self._on_autostart).pack(anchor="w", pady=2)
-        self.news_bar_var = tk.BooleanVar(value=self.cfg.get("news_bar", True))
-        dark_checkbutton(checks, "底部滚动财经热搜（百度热搜·财经榜）", self.news_bar_var,
-                         bg=C_CARD, command=self._on_news_bar_toggle).pack(
-            anchor="w", pady=2)
 
         # 底部操作
         btns = tk.Frame(body, bg=C_BG)
         btns.pack(fill="x", padx=PAD)
         ttk.Button(btns, text="立即刷新", style="Gold.TButton",
                    command=self._poll_once).pack(side="left")
-        ttk.Button(btns, text="测试弹窗", command=self._test_alert).pack(side="left", padx=8)
+        ttk.Button(btns, text="测试弹窗", command=self._test_alert).pack(side="left", padx=10)
         ttk.Button(btns, text="暗中观察", command=self.hide_window).pack(side="right")
 
-        tk.Frame(body, bg=C_LINE, height=1).pack(fill="x", padx=PAD, pady=(10, 0))
+        tk.Frame(body, bg=C_LINE, height=1).pack(fill="x", padx=PAD, pady=(12, 0))
         self.status_var = tk.StringVar(value="")
         tk.Label(body, textvariable=self.status_var, bg=C_BG, fg=C_TXT_3,
-                font=(FONT, 8), wraplength=380, justify="left").pack(
-            anchor="w", padx=PAD, pady=(5, 8))
+                font=(FONT, 8), wraplength=430, justify="left").pack(
+            anchor="w", padx=PAD, pady=(7, 14))
 
-        self._build_news_bar(body)
-
-    def _build_news_bar(self, parent):
-        """底部财经热搜跑马灯：悬停暂停、点击打开完整榜单。"""
-        bar = tk.Frame(parent, bg=C_CARD, highlightbackground=C_LINE,
-                       highlightthickness=1)
-        head = tk.Frame(bar, bg=C_CARD)
-        head.pack(fill="x", padx=10, pady=(5, 0))
-        tk.Frame(head, bg=C_GOLD, width=3, height=12).pack(side="left", padx=(0, 6))
-        tk.Label(head, text="财经热搜", bg=C_CARD, fg=C_GOLD_HI,
-                font=(FONT, 9, "bold")).pack(side="left")
-        self._news_count_var = tk.StringVar(value="")
-        tk.Label(head, textvariable=self._news_count_var, bg=C_CARD, fg=C_TXT_3,
-                font=(FONT, 8)).pack(side="left", padx=(6, 0))
-        tk.Label(head, text="悬停暂停 · 点击看全部", bg=C_CARD, fg=C_TXT_3,
-                font=(FONT, 8)).pack(side="right")
-        self._news_cv = tk.Canvas(bar, height=26, bg=C_CARD, highlightthickness=0)
-        self._news_cv.pack(fill="x", padx=8, pady=(2, 5))
-        self._news_cv.bind("<Enter>", lambda e: setattr(self, "_news_paused", True))
-        self._news_cv.bind("<Leave>", lambda e: setattr(self, "_news_paused", False))
-        self._news_cv.bind("<Button-1>", lambda e: self._open_news_list())
-        self._news_cv.configure(cursor="hand2")
-        if self.cfg.get("news_bar", True):
-            bar.pack(fill="x", padx=16, pady=(0, 10), side="bottom")
-            self._news_gen += 1
-            self._news_cv.after(600, lambda g=self._news_gen: self._news_loop(g))
-            self._news_cv.after(600, lambda g=self._news_gen: self._news_tick(g))
-
-    # ---- 财经热搜跑马灯 ----
+    # ---- 监控设置折叠 ----
     def _toggle_settings(self, _event=None):
         """监控设置卡片折叠/展开：低频设置收起后窗口明显变短。"""
         opened = not self.cfg.get("settings_open", False)
@@ -1629,170 +1601,240 @@ class GoldMonitorApp:
         self.root.update_idletasks()
         self._fit_window()
 
-    def _on_news_bar_toggle(self):
-        self.cfg["news_bar"] = bool(self.news_bar_var.get())
-        self._persist()
-        # 重建主界面以增删底部跑马灯
-        self._news_gen += 1
-        self.body.destroy()
-        self._build_ui()
-        self._fit_window()
-        self._refresh_view_from_cache()
-
-    def _news_loop(self, gen):
-        """定时后台拉取百度财经榜；仅在当前代际且开启时运转。"""
-        if gen != self._news_gen or not self.cfg.get("news_bar", True):
-            return
-        if not self._news_loading:
-            self._news_loading = True
-
-            def work():
-                data, err = None, None
-                try:
-                    data = fetch_finance_hot()
-                except Exception as e:
-                    err = e
-
-                def ui():
-                    self._news_loading = False
-                    if gen != self._news_gen:
-                        return
-                    if err is None:
-                        self._news_loaded_once = True
-                        # 已有滚动状态且榜首未变时，静默替换不打断滚动
-                        first_changed = (not self._news_items or
-                                         not data or
-                                         self._news_items[0]["word"] != data[0]["word"])
-                        self._news_items = data
-                        self._news_count_var.set(
-                            "共 %d 条 · Top%d" % (len(data),
-                                                  min(NEWS_TOP_N, len(data)))
-                            if data else "")
-                        if first_changed:
-                            self._news_reset_scroll()
-                        else:
-                            self._news_render()
-                    elif not self._news_items:
-                        self._news_draw_hint("热搜获取失败，10 分钟后重试…")
-                self.root.after(0, ui)
-
-            threading.Thread(target=work, daemon=True).start()
-        self.root.after(NEWS_REFRESH_SEC * 1000,
-                        lambda: self._news_loop(gen))
-
-    def _news_segments(self):
-        """拼成滚动文本：排名. 标题 热度，各条之间用金色菱形分隔；只滚前 N 条。"""
-        parts, gap = [], "    ◆    "
-        for n in self._news_items[:NEWS_TOP_N]:
-            t = n["word"]
-            if len(t) > 40:
-                t = t[:40] + "…"
-            hot = _format_hot(n["hot"])
-            parts.append("%d. %s %s" % (n["rank"], t, hot) if hot
-                         else "%d. %s" % (n["rank"], t))
-        return gap.join(parts), gap
-
-    def _news_reset_scroll(self):
-        self._news_text_w = self._news_font.measure(
-            self._news_segments()[0]) if self._news_items else 0
-        w = self._news_cv.winfo_width() or 388
-        self._news_x = w  # 从右侧滚入
-        self._news_render()
-
-    def _news_render(self):
-        cv = self._news_cv
-        cv.delete("all")
-        if not self._news_items:
-            self._news_draw_hint("正在获取财经热搜…"
-                                 if not self._news_loaded_once else "暂无财经热搜")
-            return
-        text, _ = self._news_segments()
-        cv.create_text(self._news_x, 13, text=text, anchor="w",
-                       fill=C_TXT, font=(FONT, 9))
-        if not self._news_paused:
-            self._news_x -= 1
-            w = cv.winfo_width() or 388
-            if self._news_x + self._news_text_w < 0:
-                self._news_x = w
-
-    def _news_tick(self, gen):
-        """唯一的 40ms 动画心跳：代际匹配才重绘并续期，避免多条滚动链。"""
-        if gen != self._news_gen or not self.cfg.get("news_bar", True):
-            return
-        self._news_render()
-        self.root.after(40, lambda: self._news_tick(gen))
-
-    def _news_draw_hint(self, text):
-        cv = self._news_cv
-        cv.delete("all")
-        cv.create_text((cv.winfo_width() or 388) // 2, 13, text=text,
-                       fill=C_TXT_3, font=(FONT, 9))
-
+    # ---- 财经热搜弹窗（按需打开，平时不占主界面、不后台取数）----
     def _open_news_list(self):
-        """财经热榜面板：完整榜单，点标题打开百度搜索结果。"""
+        """财经热搜榜：独立弹窗完整榜单，打开才拉取，弹窗打开期间每 10 分钟自动刷新。"""
         if self._news_list_win is not None:
             try:
                 if tk.Toplevel.winfo_exists(self._news_list_win):
                     self._news_list_win.lift()
+                    self._news_list_win.focus_force()
                     return
             except Exception:
                 pass
+
         win = tk.Toplevel(self.root)
         self._news_list_win = win
         win.title("财经热搜 · 百度热搜财经榜")
         win.configure(bg=C_BG)
-        win.geometry("460x560")
+        win.geometry("500x640")
+        win.minsize(440, 480)
         win.transient(self.root)
 
+        meta = {"job": None}       # 自动刷新 after 句柄
+
         def on_close():
+            if meta["job"] is not None:
+                try:
+                    win.after_cancel(meta["job"])
+                except Exception:
+                    pass
+                meta["job"] = None
             self._news_list_win = None
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", on_close)
 
-        tk.Label(win, text="百度热搜 · 财经榜（每 10 分钟自动刷新，点击标题查看详情）",
-                 bg=C_BG, fg=C_TXT_2, font=(FONT, 9)).pack(
-            anchor="w", padx=14, pady=(12, 6))
+        # 顶部金色细线 + 标题行
+        tk.Frame(win, bg=C_GOLD, height=2).pack(fill="x")
+        head = tk.Frame(win, bg=C_BG)
+        head.pack(fill="x", padx=18, pady=(14, 2))
+        tk.Label(head, text="财经热搜", bg=C_BG, fg=C_GOLD_HI,
+                 font=(FONT, 14, "bold")).pack(side="left")
+        refresh_btn = tk.Label(head, text="↻ 刷新", bg=C_BG, fg=C_GOLD,
+                               font=(FONT, 9), cursor="hand2")
+        refresh_btn.pack(side="right")
+
+        self._news_sub_var = tk.StringVar(value="百度热搜 · 财经榜")
+        tk.Label(win, textvariable=self._news_sub_var, bg=C_BG, fg=C_TXT_3,
+                 font=(FONT, 8), anchor="w").pack(fill="x", padx=18, pady=(0, 8))
+
+        # 榜单卡：Canvas + 内嵌 Frame 实现滚动
         box = tk.Frame(win, bg=C_CARD, highlightbackground=C_LINE,
                        highlightthickness=1)
-        box.pack(fill="both", expand=True, padx=14, pady=(0, 8))
-        txt = tk.Text(box, wrap="word", bd=0, bg=C_CARD, fg=C_TXT,
-                      font=(FONT, 9), padx=12, pady=10, spacing1=2,
-                      spacing3=8, cursor="arrow", height=20)
-        vsb = ttk.Scrollbar(box, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=vsb.set, state="disabled")
+        box.pack(fill="both", expand=True, padx=16, pady=(0, 6))
+        canvas = tk.Canvas(box, bg=C_CARD, highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(box, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
-        txt.pack(side="left", fill="both", expand=True)
+        canvas.pack(side="left", fill="both", expand=True)
+        rows = tk.Frame(canvas, bg=C_CARD)
+        rows_id = canvas.create_window((0, 0), window=rows, anchor="nw")
+
+        def on_rows_configure(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        rows.bind("<Configure>", on_rows_configure)
+
+        def on_canvas_configure(e):
+            canvas.itemconfigure(rows_id, width=e.width)
+        canvas.bind("<Configure>", on_canvas_configure)
+
+        def on_wheel(e):
+            canvas.yview_scroll(int(-e.delta / 120), "units")
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", on_wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        hint_var = tk.StringVar(value="榜单加载中…")
 
         def render():
             if not win.winfo_exists():
                 return
-            txt.configure(state="normal")
-            txt.delete("1.0", "end")
-            if not self._news_items:
-                txt.insert("end", "\n暂无榜单（可能正在获取或网络不可用）。")
-            for i, n in enumerate(self._news_items):
-                tag = "n%d" % i
-                hot = _format_hot(n["hot"])
-                head = "%2d.  " % n["rank"]
-                txt.insert("end", head)
-                txt.insert("end", n["word"] + "\n", tag)
-                if hot:
-                    txt.insert("end", "      热度 %s\n\n" % hot)
-                else:
-                    txt.insert("end", "\n")
-                txt.tag_configure(tag, foreground=C_GOLD_HI if n["url"] else C_TXT,
-                                  font=(FONT, 9, "underline" if n["url"] else "normal"))
-                if n["url"]:
-                    txt.tag_bind(tag, "<Button-1>",
-                                 lambda e, u=n["url"]: webbrowser.open(u))
-                    txt.tag_bind(tag, "<Enter>",
-                                 lambda e: txt.configure(cursor="hand2"))
-                    txt.tag_bind(tag, "<Leave>",
-                                 lambda e: txt.configure(cursor="arrow"))
-            txt.configure(state="disabled")
+            for w in rows.winfo_children():
+                w.destroy()
+            data = self._news_items
+            if not data:
+                hint_lbl = tk.Label(rows, textvariable=hint_var, bg=C_CARD,
+                                    fg=C_TXT_3, font=(FONT, 9), pady=40)
+                hint_lbl.pack()
+                return
+            for n in data:
+                self._news_row(rows, n)
 
-        render()
-        ttk.Button(win, text="关闭", command=on_close).pack(pady=(0, 12))
+        def set_subtitle(note=""):
+            if not win.winfo_exists():
+                return
+            t = "百度热搜 · 财经榜"
+            if self._news_last_ok:
+                t += " · 更新于 " + self._news_last_ok
+            t += " · 每 %d 分钟自动刷新" % (NEWS_REFRESH_SEC // 60)
+            if note:
+                t += " · " + note
+            self._news_sub_var.set(t)
+
+        def loaded(data, err):
+            self._news_loading = False
+            if not win.winfo_exists():
+                return
+            refresh_btn.configure(fg=C_GOLD)
+            if err is None and data:
+                self._news_items = data
+                self._news_last_fetch = time.time()
+                self._news_last_ok = datetime.now().strftime("%H:%M")
+                render()
+                set_subtitle()
+            elif self._news_items:
+                set_subtitle("刷新失败，继续显示旧榜单")
+            else:
+                hint_var.set("榜单获取失败，点右上角“刷新”重试")
+                render()
+            try:
+                meta["job"] = win.after(NEWS_REFRESH_SEC * 1000,
+                                        lambda: self._news_load(True, loaded))
+            except Exception:
+                pass
+
+        def manual_refresh(_e=None):
+            if self._news_loading:
+                return
+            refresh_btn.configure(fg=C_TXT_3)
+            self._news_load(True, loaded)
+        refresh_btn.bind("<Button-1>", manual_refresh)
+        refresh_btn.bind("<Enter>", lambda _e: refresh_btn.configure(fg=C_GOLD_HI))
+        refresh_btn.bind("<Leave>", lambda _e: refresh_btn.configure(fg=C_GOLD))
+
+        # 首次：有 10 分钟内缓存直接用，否则后台拉取
+        if self._news_items and time.time() - self._news_last_fetch < NEWS_REFRESH_SEC:
+            render()
+            set_subtitle()
+            try:
+                meta["job"] = win.after(NEWS_REFRESH_SEC * 1000,
+                                        lambda: self._news_load(True, loaded))
+            except Exception:
+                pass
+        else:
+            render()
+            self._news_load(True, loaded)
+
+        ttk.Button(win, text="关闭", command=on_close).pack(pady=(2, 14))
+
+    def _news_row(self, parent, n):
+        """榜单中的一行：排名徽章 + 标题（热/新/沸标签）+ 热度与升降 + 简介。"""
+        row = tk.Frame(parent, bg=C_CARD)
+        row.pack(fill="x", padx=14, pady=(8, 0))
+
+        top = tk.Frame(row, bg=C_CARD)
+        top.pack(fill="x")
+        rank = n.get("rank", 0)
+        r_bg = C_GOLD if rank <= 3 else C_CARD_2
+        r_fg = C_ON_GOLD if rank <= 3 else C_TXT_2
+        tk.Label(top, text=str(rank), bg=r_bg, fg=r_fg, width=2,
+                 font=(FONT, 9, "bold"), padx=2, pady=1).pack(side="left",
+                                                               anchor="n")
+        mid = tk.Frame(top, bg=C_CARD)
+        mid.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        tline = tk.Frame(mid, bg=C_CARD)
+        tline.pack(fill="x")
+        has_url = bool(n.get("url"))
+        title = tk.Label(tline, text=n["word"], bg=C_CARD,
+                         fg=C_GOLD_HI if has_url else C_TXT,
+                         font=(FONT, 10, "bold"), anchor="w", justify="left",
+                         wraplength=310, cursor="hand2" if has_url else "arrow")
+        title.pack(side="left")
+        tag_map = {"1": ("新", C_DOWN), "3": ("沸", C_UP)}
+        tag_label, tag_fg = tag_map.get(n.get("tag", ""), ("", C_GOLD))
+        if tag_label:
+            tk.Label(tline, text=tag_label, bg=C_CARD, fg=tag_fg,
+                     font=(FONT, 8, "bold"), padx=2).pack(side="left", padx=(4, 0))
+
+        hotline = tk.Frame(top, bg=C_CARD)
+        hotline.pack(side="right", anchor="n", padx=(8, 0))
+        change = n.get("change", "")
+        if change in ("up", "down"):
+            arrow, c_fg = ("▲", C_UP) if change == "up" else ("▼", C_DOWN)
+            tk.Label(hotline, text=arrow, bg=C_CARD, fg=c_fg,
+                     font=(FONT, 8)).pack(side="left")
+        hot = _format_hot(n.get("hot"))
+        if hot:
+            tk.Label(hotline, text=hot, bg=C_CARD, fg=C_TXT_2,
+                     font=(FONT, 9, "bold")).pack(side="left", padx=(3, 0))
+
+        desc = n.get("desc", "")
+        if desc:
+            tk.Label(mid, text=desc, bg=C_CARD, fg=C_TXT_3,
+                     font=(FONT, 8), anchor="w", justify="left",
+                     wraplength=360).pack(fill="x", pady=(2, 0))
+
+        tk.Frame(parent, bg=C_LINE, height=1).pack(fill="x", padx=14, pady=(8, 0))
+
+        if has_url:
+            def open_url(_e=None, u=n["url"]):
+                try:
+                    webbrowser.open(u)
+                except Exception:
+                    pass
+            for w in (row, top, mid, tline, title):
+                w.bind("<Button-1>", open_url)
+            title.bind("<Enter>", lambda _e: title.configure(fg=C_GOLD))
+            title.bind("<Leave>",
+                       lambda _e: title.configure(fg=C_GOLD_HI))
+
+    def _news_load(self, force, callback):
+        """后台拉取财经榜；成功/失败均在 UI 线程回调 (data, err)。带 10 分钟节流。"""
+        if self._news_loading:
+            return
+        if not force and self._news_items and \
+                time.time() - self._news_last_fetch < NEWS_REFRESH_SEC:
+            callback(self._news_items, None)
+            return
+        self._news_loading = True
+
+        def work():
+            data, err = None, None
+            try:
+                data = fetch_finance_hot()
+            except Exception as e:
+                err = e
+
+            def ui():
+                self._news_loading = False
+                if not self.root.winfo_exists():
+                    return
+                callback(data, err)
+            try:
+                self.root.after(0, ui)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
 
 
     def _toggle_theme(self):
@@ -1813,6 +1855,13 @@ class GoldMonitorApp:
                         closer()
                     except Exception:
                         pass
+        # 财经热搜弹窗没有独立 close 方法，直接销毁
+        if self._news_list_win is not None:
+            try:
+                self._news_list_win.destroy()
+            except Exception:
+                pass
+            self._news_list_win = None
         apply_dark_style(self.root)
         self.root.configure(bg=C_BG)
         self.body.destroy()
