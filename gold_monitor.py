@@ -36,7 +36,8 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-# 每日 22:30 日结价（支付宝收益口径）：黄金T+D夜盘22:30收盘价，本地逐日积累
+# 每日 22:20 日结价（支付宝/工行积存金收益口径）：交易 9:10-22:20 截止那一刻的
+# 银行自报价（以 Au(T+D)/境外价为参考，非任何公开盘中价），本地逐日积累
 SETTLE_PATH = os.path.join(BASE_DIR, "settle_prices.json")
 # 本地分时行情（工行无公开历史分时接口，只能程序运行期间自行采集累积）
 HISTORY_PATH = os.path.join(BASE_DIR, "price_history.json")
@@ -58,19 +59,10 @@ EM_KLINE_URL = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
                 "?secid=118.AU9999&fields1=f1,f2,f3,f4,f5,f6"
                 "&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=0"
                 "&beg={beg}&end={end}&lmt=1000000")
-# 黄金T+D（AUTD）5分钟K：取每晚 22:30 那根K的收盘价作为积存金日结价代理。
-# 东财分钟K仅保留最近约 10 个交易日，更早日期取不到，只能本地逐日积累/截图反推。
-EM_SETTLE_URL = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
-                 "?secid=118.AUTD&fields1=f1,f2,f3,f4,f5,f6"
-                 "&fields2=f51,f52,f53,f54,f55,f56&klt=5&fqt=0"
-                 "&beg={beg}&end={end}&lmt=1000000")
 EM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
               "Referer": "https://quote.eastmoney.com/"}
 EM_TRENDS_TTL = 60     # 分时缓存秒数（交易时段内 1 分钟刷新一次即可）
 EM_KLINE_TTL = 1800    # 日K缓存秒数
-EM_SETTLE_TTL = 600    # AUTD夜盘日结价缓存秒数（夜盘22:30后10分钟内可刷新到新值）
-# 工作日 22:35 起自动对齐当晚支付宝口径日结价（AUTD 22:30 五分钟K收盘）
-SETTLE_SYNC_HM = "22:35"
 
 # 工行老站点使用旧版 TLS 重协商，OpenSSL 3 默认拒绝，需要显式放开
 SSL_CONTEXT = ssl.create_default_context()
@@ -559,11 +551,12 @@ def save_history(hist):
         pass
 
 
-# ---------- 每日日结价（支付宝收益口径：每晚 22:30） ----------
+# ---------- 每日日结价（支付宝/工行积存金收益口径：每晚 22:20 截止自报价） ----------
 
 def load_settles():
-    """读取日结价：{"YYYY-MM-DD": {"price": 价, "src": icbc|alipay|em}, ...}。
-    兼容旧版仅存裸数值的写法；按日期升序返回。"""
+    """读取日结价：{"YYYY-MM-DD": {"price": 价, "src": icbc|alipay|est}, ...}。
+    兼容旧版仅存裸数值的写法；按日期升序返回。src=icbc 为程序22:20自动锁定，
+    alipay 为按支付宝截图反推的人工精确价，est 为日K近似。"""
     out = {}
     try:
         with open(SETTLE_PATH, "r", encoding="utf-8") as f:
@@ -606,13 +599,13 @@ def append_history_point(hist, day, hm, price):
 
 
 def in_trade_session(hm):
-    """积存金交易时段：周一至周五 9:10-22:30（节假日无法本地判断，由接口有无报价兜底）。"""
-    return "09:10" <= hm <= "22:30"
+    """积存金交易时段：周一至周五 9:10-22:20（节假日无法本地判断，由接口有无报价兜底）。"""
+    return "09:10" <= hm <= "22:20"
 
 
 def trade_minutes():
-    """交易时段总分钟数（9:10-22:30 连续计时，与支付宝分时横轴一致）。"""
-    return (22 * 60 + 30) - (9 * 60 + 10)
+    """交易时段总分钟数（9:10-22:20 连续计时，与支付宝分时横轴一致）。"""
+    return (22 * 60 + 20) - (9 * 60 + 10)
 
 
 # ---------- 在线趋势行情（东方财富 · 上金所黄金9999，免鉴权） ----------
@@ -640,7 +633,7 @@ def fetch_em_trends():
     周一的会话还含周五夜盘）。
     返回 {"date": 东财交易日(夜盘起始日), "pre_close": 昨收,
           "points": [["YYYY-MM-DD HH:MM", 价格], ...]}（保留完整时间戳，
-          由渲染方按自然日与积存金时段 9:00-15:30/20:00-22:30 自行过滤）。
+          由渲染方按自然日与积存金时段 9:10-15:30/20:00-22:20 自行过滤）。
     只保留价格大于 0 的分钟点（集合竞价/无成交时段会出现 0 值）。
     """
     d = (_get_em_json(EM_TRENDS_URL) or {}).get("data") or {}
@@ -678,37 +671,17 @@ def fetch_em_daily(beg, end):
     return out
 
 
-def fetch_autd_settle(beg, end):
-    """拉黄金T+D 5分钟K（beg/end 为 "YYYYMMDD"），提取每个自然日时间戳 22:30
-    那根K的收盘价——即当晚收盘集合竞价（22:25-22:30）的成交价。
-    支付宝积存金每日收益正是按此时点的金价结算（8 日实测平均误差 0.17 元/克）。
-    返回 {"YYYY-MM-DD": 价}，东财分钟K仅保留最近约 10 个交易日。"""
-    d = (_get_em_json(EM_SETTLE_URL.format(beg=beg, end=end)) or {}).get("data") or {}
-    out = {}
-    for row in d.get("klines") or []:
-        seg = row.split(",")
-        if len(seg) < 3 or len(seg[0]) < 16 or seg[0][11:16] != "22:30":
-            continue
-        try:
-            out[seg[0][:10]] = float(seg[2])
-        except ValueError:
-            continue
-    return out
-
-
-# ---------- 每日盈亏（日结价 + 交易记录直接重算，与支付宝同口径） ----------
-
 def daily_pl_rows(settles, est_daily, trades, total_grams,
                   live_sell=None, today=None, now_hm=None):
-    """根据每晚 22:30 日结价与买入明细，逐日重算每日盈亏（支付宝同口径）。
+    """根据每晚 22:20 日结价与买入明细，逐日重算每日盈亏（支付宝同口径）。
 
-    settles:  {"YYYY-MM-DD": 日结价} 精确价（本地记录/AUTD夜盘/支付宝反推，22:30口径）
+    settles:  {"YYYY-MM-DD": 日结价} 精确价（工行22:20截止自报价/支付宝截图反推）
     est_daily: [["YYYY-MM-DD", 开, 收, 高, 低], ...] 黄金9999日K，仅用于无日结价的
                早期日期近似（凌晨收盘口径，误差较大，行上标 est=True）
     trades:   [{"dt": "YYYY-MM-DD HH:MM", "grams": g, "amount": a}, ...]（均为买入）
     total_grams: 当前总持仓克数；底仓 = 总持仓 − 明细合计（早于所有记录交易的存量）
-    live_sell: 最新工行积存金赎回价。盘中（now_hm < 22:30）且 today 已有日结基准时，
-               “今日”一行按实时盈亏计算（昨夜日结价→实时赎回价）；22:30 后日结价
+    live_sell: 最新工行积存金赎回价。盘中（now_hm < 22:20）且 today 已有日结基准时，
+               “今日”一行按实时盈亏计算（昨夜日结价→实时赎回价）；22:20 后日结价
                已生成，则按日结价显示“收盘”。
     today:    实时盈亏所属交易日（"YYYY-MM-DD"），默认取序列最后一日
     now_hm:   当前 "HH:MM"，用于判断今日是否已收盘；默认 "23:59"（视为已收盘）
@@ -719,8 +692,8 @@ def daily_pl_rows(settles, est_daily, trades, total_grams,
       当日盈亏 = 当日结算持仓克数 × (今日日结价 − 上一交易日日结价)
       当日结算持仓 = 开盘存量 + 当日买入克数（当日买入即计入，按上一交易日
       日结价给新买入计当日盈亏；买入价只影响成本，不进入日盈亏公式）。
-    日结价优先取 settles（积存金22:30口径）；早期免费分钟K拿不到的日期，
-    用黄金9999日K收盘价近似并标记为估算。
+    日结价优先取 settles（工行22:20截止自报价，与支付宝同源）；程序未运行而
+    漏记的日期，用黄金9999日K收盘价近似并标记为估算。
     """
     est_close = {r[0]: float(r[2]) for r in (est_daily or [])}
     close = {}
@@ -762,7 +735,7 @@ def daily_pl_rows(settles, est_daily, trades, total_grams,
     prev_d, prev_c = None, None  # 上一有有效日结价的交易日（缺口日期不打断基准）
     for d in dates2:
         cur_c = close.get(d)
-        is_today = bool(live_sell) and d == today and now_hm <= "22:30"
+        is_today = bool(live_sell) and d == today and now_hm <= "22:20"
         if cur_c is None and not is_today:
             # 既无日结价又非盘中实时（如早期缺口/非交易日）：不产出，但买入仍计入存量
             grams_open += buy_g.get(d, 0.0)
@@ -1244,9 +1217,6 @@ class GoldMonitorApp:
         self._last_hist_save = 0.0
         self._settles = load_settles()  # 本地日结价 {交易日: {"price","src"}}
         self._settle_recorded_day = None  # 本次运行已自动记录日结价的交易日（防重）
-        self._settle_aligned_day = None   # 本次运行已对齐支付宝口径日结价的交易日
-        self._settle_backfilled = False   # 启动后是否已回补近期缺失日结价
-        self._settle_syncing = False      # AUTD 对齐请求是否在途
         # 补仓计划到价状态：{计划价: 是否已弹过提醒}；首个买入价建立基线，
         # 基线价之下的计划默认已触发状态（不打扰），价格涨回去后重新武装
         self._plans_fired = None
@@ -1262,8 +1232,6 @@ class GoldMonitorApp:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self.root.after(300, self._poll_once)
         self.root.after(1200, self._pulse_dot)
-        # 启动后稍等即回补近期缺失的支付宝口径日结价，之后每 5 分钟检查夜间对齐
-        self.root.after(5000, self._settle_tick)
 
     # ---- UI ----
     def _fit_window(self):
@@ -1627,7 +1595,7 @@ class GoldMonitorApp:
         if date_str and date_str != self._trade_date:
             self._trade_date = date_str
 
-    # ---- 每日盈亏：每晚22:30日结价 + 交易记录直接重算（不依赖本机常驻） ----
+    # ---- 每日盈亏：每晚22:20工行结算价 + 交易记录直接重算（不依赖本机常驻） ----
     def _pl_range(self):
         """每日盈亏取数区间：首笔买入前 20 个自然日 ~ 今天（YYYYMMDD）。"""
         trades = self.cfg.get("trades") or []
@@ -1638,49 +1606,9 @@ class GoldMonitorApp:
         return beg, end
 
     def _pl_settle_map(self):
-        """合并本地日结价（含工行每晚记录/支付宝反推）与东财AUTD近10日夜盘价。
-        本地记录优先，EM 仅补充本地缺失的日期。"""
-        merged = {d: float(v["price"]) for d, v in self._settles.items() if v.get("price")}
-        cached = self._em_cache.get("settle_em")
-        if cached and time.time() - cached[1] < EM_SETTLE_TTL:
-            for d, p in (cached[0] or {}).items():
-                if d not in merged:
-                    merged[d] = p
-        return merged
-
-    def _pl_settle_sync(self):
-        """后台拉取黄金T+D近10日5分钟K（提取每晚22:30收盘）。已在拉取则跳过。"""
-        cached = self._em_cache.get("settle_em")
-        if cached and time.time() - cached[1] < EM_SETTLE_TTL:
-            return
-        if "settle_em" in self._em_loading:
-            return
-        self._em_loading.add("settle_em")
-        end = datetime.now()
-        beg = (end - timedelta(days=14)).strftime("%Y%m%d")
-
-        def work():
-            data, err = None, None
-            try:
-                data = fetch_autd_settle(beg, end.strftime("%Y%m%d"))
-                self._em_cache["settle_em"] = (data, time.time())
-            except Exception as e:
-                err = e
-
-            def ui():
-                self._em_loading.discard("settle_em")
-                if data is not None:
-                    self._render_position()
-                    if self._pl_win is not None:
-                        self._refresh_pl_calendar()
-                    if self._chart_win is not None and \
-                            self.CHART_MODES.get(self._chart_mode_var.get()) == "local":
-                        self._draw_chart()
-                elif self._pl_win is not None:
-                    self._refresh_pl_calendar(err)
-            self.root.after(0, ui)
-
-        threading.Thread(target=work, daemon=True).start()
+        """本地日结价（工行每晚22:20截止自报价/支付宝截图反推）。
+        日结价是银行自主报价、无公开接口，只能本地逐日积累，故不再合并任何在线代理。"""
+        return {d: float(v["price"]) for d, v in self._settles.items() if v.get("price")}
 
     def _pl_klines_sync(self):
         """命中有效缓存返回黄金9999日K（仅作早期估算），否则返回 None（后台拉取）。"""
@@ -1715,9 +1643,8 @@ class GoldMonitorApp:
         return None
 
     def _daily_rows(self):
-        """计算每日盈亏行。精确日结价由本地记录+AUTD夜盘提供；早期无日结价的日期
-        用黄金9999日K近似（标记估算），未就绪时触发后台拉取并返回 None。"""
-        self._pl_settle_sync()
+        """计算每日盈亏行。精确日结价取本地记录（工行22:20截止自报价/支付宝反推）；
+        程序漏记的日期用黄金9999日K近似（标记估算），未就绪时触发后台拉取并返回 None。"""
         settles = self._pl_settle_map()
         if not settles:
             return None
@@ -1725,7 +1652,7 @@ class GoldMonitorApp:
         now = datetime.now()
         now_hm = now.strftime("%H:%M")
         live_today = self._trade_date
-        # 实时行仅在工作日交易时段（9:10-22:30）生效，避免周末/盘后陈旧报价冒充实时
+        # 实时行仅在工作日交易时段（9:10-22:20）生效，避免周末/盘后陈旧报价冒充实时
         live_sell = None
         if live_today and now.weekday() < 5 and in_trade_session(now_hm):
             live_sell = self._latest_sell
@@ -2199,9 +2126,10 @@ class GoldMonitorApp:
                 font=(FONT, 9), justify="left", anchor="w",
                 wraplength=380).pack(anchor="w", padx=10, pady=8)
 
-        tk.Label(win, text="每日盈亏与支付宝同口径：按每晚 22:30 黄金T+D夜盘收盘价结算"
-                          "（程序晚盘在线时自动记录工行当日最后报价，近10日自动核对东财，"
-                          "更早日期用黄金9999日K近似并标“估”）；当日盘中按实时赎回价。"
+        tk.Label(win, text="每日盈亏与支付宝同口径：按每晚 22:20 交易截止时工行积存金"
+                          "报价结算（程序 22:20 在线即自动锁定；该价为银行以 Au(T+D)/"
+                          "境外价为参考的自报价，无公开接口；程序未运行而漏记的日期"
+                          "用黄金9999日K近似并标“估”）；当日盘中按实时赎回价。"
                           "每日盈亏=(昨日存量+当日买入)×(今收−昨收)，当日买入即计入、"
                           "统一按上一交易日日结价起算；买入价只影响成本，不参与当日盈亏。",
                 bg=C_BG, fg=C_TXT_3, font=(FONT, 7),
@@ -2250,12 +2178,12 @@ class GoldMonitorApp:
             child.destroy()
 
         if rows is None:
-            msg = "夜盘日结价加载中…" if not fetch_error else f"日结价获取失败：{fetch_error}\n将随下次行情刷新自动重试"
+            msg = "日结价加载中…" if not fetch_error else f"行情获取失败：{fetch_error}\n将随下次刷新自动重试"
             tk.Label(self._pl_grid, text=msg, bg=C_BG, fg=C_TXT_2,
                     font=(FONT, 10), justify="center").grid(
                 row=0, column=0, columnspan=7, pady=40)
             self._pl_month_var.set("本月盈亏 …")
-            self._pl_detail_var.set("正在获取黄金T+D近10日夜盘日结价…")
+            self._pl_detail_var.set("正在获取黄金9999日K估算价…")
             return
 
         # 本月盈亏合计（仅日历区间内的交易日）
@@ -2351,7 +2279,7 @@ class GoldMonitorApp:
         elif info.get("est"):
             tag = "（估算·黄金9999日K近似）"
         else:
-            tag = "（收盘·22:30夜盘结算）"
+            tag = "（收盘·22:20 工行结算价）"
         chg = info["mark"] - info["prev"]
         hold_pl = info["grams_open"] * chg
         # 支付宝口径：当日买入即计入结算持仓，与存量统一按上一交易日日结价起算
@@ -2377,7 +2305,7 @@ class GoldMonitorApp:
         sgn = "+" if info["pl"] >= 0 else ""
         lines.append(f"当日合计盈亏 {sgn}{info['pl']:,.2f} 元")
         if info.get("est"):
-            lines.append("注：该日无22:30夜盘日结价记录，按黄金9999日收盘价近似。")
+            lines.append("注：该日无 22:20 结算价记录（程序当时未运行），按黄金9999日收盘价近似。")
         self._pl_detail_var.set("\n".join(lines))
 
     def _close_pl_calendar(self):
@@ -2738,12 +2666,12 @@ class GoldMonitorApp:
         day_days = sorted({ts[:10] for ts, _ in all_pts if ts[11:16] >= "09:00"})
         any_days = sorted({ts[:10] for ts, _ in all_pts})
         date = day_days[-1] if day_days else (any_days[-1] if any_days else "")
-        # 积存金交易时段对应的上金所盘口：白盘 9:00-15:30、夜盘 20:00-22:30；
+        # 积存金交易时段对应的上金所盘口：白盘 9:10-15:30、夜盘 20:00-22:20；
         # 午间休市（11:30-13:30）与盘间休市（15:30-20:00）按点序等距压缩
         pts = [[ts[11:16], p] for ts, p in all_pts
                if ts[:10] == date
                and ("08:59" <= ts[11:16] <= "15:31"
-                    or "19:59" <= ts[11:16] <= "22:30")]
+                    or "19:59" <= ts[11:16] <= "22:20")]
         if len(pts) < 2:
             self._chart_message(
                 cv, L, R, T, B,
@@ -3027,7 +2955,7 @@ class GoldMonitorApp:
             pmax = max(p for _, p in pts)
             pmin = min(p for _, p in pts)
             last_p = pts[-1][1]
-            base = None  # 昨收基准：上一交易日22:30夜盘日结价（早期缺口日为9999日K近似）
+            base = None  # 昨收基准：上一交易日22:20工行结算价（缺口日为9999日K近似）
             _rows = self._daily_rows()
             if _rows and selected in _rows:
                 base = _rows[selected]["prev"]
@@ -3040,14 +2968,14 @@ class GoldMonitorApp:
                            text=f"工银积存金 · 赎回价  {selected}"
                                 f"    最新 {last_p:.2f}   高 {pmax:.2f}   低 {pmin:.2f}{chg_txt}")
 
-        # 时间轴：09:10 / 13:00 / 18:00 / 22:30
+        # 时间轴：09:10 / 13:00 / 18:00 / 22:20
         total = trade_minutes()
 
         def x_of(hm):
             tm = self._hm_to_min(hm) - (9 * 60 + 10)
             return L + min(max(tm / total, 0), 1) * (R - L)
 
-        vlines = [(x_of(t), t) for t in ("09:10", "13:00", "18:00", "22:30")]
+        vlines = [(x_of(t), t) for t in ("09:10", "13:00", "18:00", "22:20")]
 
         if len(pts) < 1:
             self._draw_chart_frame(cv, L, R, T, B, 0, 1, vlines)
@@ -3302,8 +3230,8 @@ class GoldMonitorApp:
         self.pos_pl_pct_var.set(
             f"收益率 {sign}{pl / cost * 100:.2f}%" if cost else "")
 
-        # 今日盈亏：按每晚22:30日结价（本地记录/AUTD夜盘）+ 交易记录重算，与支付宝同口径；
-        # 当日22:30前用真实工行赎回价实时标记，22:30后自动转为收盘口径。
+        # 今日盈亏：按每晚22:20工行结算价（本地记录）+ 交易记录重算，与支付宝同口径；
+        # 当日22:20前用真实工行赎回价实时标记，22:20后自动转为收盘口径。
         today_pl = None
         rows = self._daily_rows()
         if rows is None:
@@ -3459,107 +3387,23 @@ class GoldMonitorApp:
         self._schedule_next()
 
     def _maybe_record_settle(self, sell):
-        """本机时间进入 22:29-22:30 收盘窗口时，用工行积存金实时赎回价记录当日日结价
-        （当日最后一次报价，与支付宝每日收益口径一致）。窗口内新报价会刷新；
-        人工录入（alipay）不覆盖。仅工作日触发。"""
+        """工作日 22:20 交易截止那一刻，用工行积存金实时报价记录当日日结价。
+        该价即支付宝每日收益口径（同一工银积存金、同一 22:20 截止自报价）。
+        22:20 后的接口报价只是跟随夜盘变动的参考价，故只在 22:20-22:24 窗口内
+        抓第一次有效报价即锁定、绝不刷新；人工录入（alipay）永不覆盖。"""
         now = datetime.now()
         hm = now.strftime("%H:%M")
-        if not sell or now.weekday() >= 5 or not ("22:29" <= hm <= "22:30"):
+        if not sell or now.weekday() >= 5 or not ("22:20" <= hm <= "22:24"):
             return
         day = now.strftime("%Y-%m-%d")
         old = self._settles.get(day)
-        if old and old.get("src") != "icbc":
-            return  # 支付宝截图反推等精确人工价优先，不自动覆盖
+        if old:
+            return  # 当晚已锁定（icbc）或是人工精确价（alipay），都不再覆盖
         price = float(sell)
-        if old and abs(float(old.get("price") or 0) - price) < 1e-9:
-            return
         self._settles[day] = {"price": price, "src": "icbc"}
         self._settles = dict(sorted(self._settles.items()))
         save_settles(self._settles)
         self._settle_recorded_day = day
-
-    # ---- 支付宝口径日结价定时对齐（AUTD 每晚 22:30 五分钟K收盘） ----
-    def _settle_tick(self):
-        """独立于行情轮询的日结价对齐调度（每 5 分钟）：
-        - 启动后回补一次近 14 天缺失日结价（东财分钟K仅保留约 10 个交易日）；
-        - 工作日过 22:35 后对齐当晚新价，K 线尚未生成时失败重试，直到当日对齐成功。"""
-        try:
-            now = datetime.now()
-            today = now.strftime("%Y-%m-%d")
-            need_night = (now.weekday() < 5
-                          and now.strftime("%H:%M") >= SETTLE_SYNC_HM
-                          and self._settle_aligned_day != today)
-            if not self._settle_backfilled or need_night:
-                self._settle_sync(night=need_night)
-        finally:
-            if not self.stop_event.is_set():
-                self.root.after(5 * 60 * 1000, self._settle_tick)
-
-    def _settle_sync(self, night=False):
-        """后台拉取近 14 天 AUTD 22:30 收盘价并合并落盘。
-        规则：填补缺失日期、以支付宝口径覆盖 src=icbc/em 的旧值，
-        绝不覆盖人工 src=alipay 记录。night=True 表示本次为当晚对齐。"""
-        if self._settle_syncing:
-            return
-        self._settle_syncing = True
-        end = datetime.now()
-        beg = (end - timedelta(days=14)).strftime("%Y%m%d")
-        end_s = end.strftime("%Y%m%d")
-        today = end.strftime("%Y-%m-%d")
-
-        def work():
-            data, err = None, None
-            try:
-                data = fetch_autd_settle(beg, end_s)
-            except Exception as e:
-                err = e
-
-            def ui():
-                self._settle_syncing = False
-                if data is None:
-                    # 夜间对齐失败（K线未生成/网络抖动），下个 tick（5 分钟）自动重试
-                    return
-                self._settle_backfilled = True
-                filled, updated = [], []
-                for d, p in data.items():
-                    old = self._settles.get(d)
-                    if old is None:
-                        filled.append(d)
-                    elif old.get("src") == "alipay":
-                        continue  # 人工按支付宝截图录入的精确价，永不覆盖
-                    elif abs(float(old.get("price") or 0) - float(p)) < 1e-9:
-                        continue
-                    else:
-                        updated.append(d)
-                    self._settles[d] = {"price": float(p), "src": "em"}
-                if filled or updated:
-                    self._settles = dict(sorted(self._settles.items()))
-                    save_settles(self._settles)
-                    self._em_cache["settle_em"] = (
-                        {d: float(v["price"])
-                         for d, v in self._settles.items()
-                         if v.get("src") in ("em", "icbc")},
-                        time.time())
-                    self._render_position()
-                    if self._pl_win is not None:
-                        self._refresh_pl_calendar()
-                    if self._chart_win is not None:
-                        mode_var = getattr(self, "_chart_mode_var", None)
-                        if mode_var is not None and \
-                                self.CHART_MODES.get(mode_var.get()) == "local":
-                            self._draw_chart()
-                # 当晚 22:30 K线已出现即视为当日对齐成功；否则留给下个 tick 重试
-                if night and today in data:
-                    self._settle_aligned_day = today
-                    if today in filled or today in updated:
-                        self.toasts.show(
-                            "日结价已对齐支付宝口径",
-                            f"{today} 日结价 {data[today]:.2f} 元/克\n"
-                            "（黄金T+D 22:30 收盘价），每日盈亏按此结算。",
-                            duration_ms=10000, kind="up")
-            self.root.after(0, ui)
-
-        threading.Thread(target=work, daemon=True).start()
 
     def _on_data(self, data):
         self.failed_count = 0
@@ -3591,7 +3435,7 @@ class GoldMonitorApp:
                 save_history(self._hist)
                 self._hist_dirty = False
                 self._last_hist_save = now_ts
-        # 22:30 收盘窗口：用工行积存金赎回价记录当日日结价（当晚最后一次报价）
+        # 22:20 交易截止：用工行积存金报价锁定当日日结价（支付宝同口径）
         self._maybe_record_settle(sell0)
         self._set_trade_date(data.get("date"))
         self._render_position()
@@ -3604,7 +3448,7 @@ class GoldMonitorApp:
 
         if price is None:
             self.price_var.set("--")
-            self.status_var.set(f"[{ts}] 当前品种暂无报价（可能不在交易时段：周一至周五 9:10-22:30）")
+            self.status_var.set(f"[{ts}] 当前品种暂无报价（可能不在交易时段：周一至周五 9:10-22:20）")
             self._schedule_next()
             return
 
