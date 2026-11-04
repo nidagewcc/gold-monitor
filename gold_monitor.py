@@ -13,6 +13,7 @@
 import json
 import math
 import os
+import re
 import ssl
 import sys
 import threading
@@ -21,9 +22,11 @@ import traceback
 import calendar
 import urllib.request
 import urllib.parse
+import webbrowser
 from datetime import datetime, timedelta
 
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox
 
 # ---------- 全局常量 ----------
@@ -63,6 +66,25 @@ EM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebK
               "Referer": "https://quote.eastmoney.com/"}
 EM_TRENDS_TTL = 60     # 分时缓存秒数（交易时段内 1 分钟刷新一次即可）
 EM_KLINE_TTL = 1800    # 日K缓存秒数
+
+# 黄金快讯跑马灯：新浪财经 7x24 直播 + 东方财富快讯，本地按关键词过滤出黄金相关
+SINA_FEED_URL = ("https://zhibo.sina.com.cn/api/zhibo/feed"
+                 "?page=1&page_size=40&zhibo_id=152&tag_id=0&type=0")
+EM_NEWS_URL = ("https://np-listapi.eastmoney.com/comm/web/getNewsByColumns"
+               "?client=web&biz=web_news_col&column=350&order=1"
+               "&needInteractData=0&page_index=1&page_size=50&req_trace=gmfeed")
+NEWS_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://finance.sina.com.cn/"}
+NEWS_REFRESH_SEC = 300   # 快讯刷新间隔（5 分钟）
+NEWS_MAX_AGE_H = 36      # 只保留最近 36 小时（覆盖周末）
+# 直接相关词命中即收；宏观词需与黄金语境共现，避免全量宏观快讯刷屏
+NEWS_KEY_CORE = ("黄金", "金价", "金饰", "金条", "现货金", "伦敦金", "COMEX金",
+                 "纽约金", "黄金ETF", "购金", "黄金储备", "央行购金", "Au99",
+                 "积存金", "盎司金", "贵金属")
+NEWS_KEY_MACRO = ("美联储", "非农", "CPI", "PPI", "降息", "加息", "利率决议",
+                  "鲍威尔", "美债收益率", "美元指数", "通胀", "PCE", "QE", "缩表")
+NEWS_KEY_GOLD_CTX = ("黄金", "金价", "贵金属", "盎司", "避险", "购金", "金条", "金饰")
+
 
 # 工行老站点使用旧版 TLS 重协商，OpenSSL 3 默认拒绝，需要显式放开
 SSL_CONTEXT = ssl.create_default_context()
@@ -107,6 +129,7 @@ DEFAULT_CONFIG = {
     # 买入价下穿目标价时弹窗提醒按计划补仓，走势图上以蓝色虚线标记
     "plans": [],
     "theme": "dark",            # 界面主题：dark（黑金暗色）/ light（浅色日间）
+    "news_bar": True,           # 底部黄金快讯跑马灯
 }
 
 # 个人积存金赎回（卖出变现）手续费率：赎回金额的 0.5%（工行 2017-03-01 起，
@@ -671,6 +694,109 @@ def fetch_em_daily(beg, end):
     return out
 
 
+# ---------- 黄金快讯（新浪 7x24 + 东财快讯，本地关键词过滤） ----------
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(s):
+    return _TAG_RE.sub("", s or "").strip()
+
+
+def _news_relevant(text):
+    """黄金直接相关词命中即收；宏观大词须与黄金语境共现，防止宏观新闻全量刷屏。"""
+    if any(k in text for k in NEWS_KEY_CORE):
+        return True
+    if any(k in text for k in NEWS_KEY_MACRO) and \
+            any(k in text for k in NEWS_KEY_GOLD_CTX):
+        return True
+    return False
+
+
+def fetch_gold_news():
+    """聚合新浪财经 7x24 与东财快讯，过滤出近 36 小时黄金相关条目。
+    两源并发拉取（新浪偶发慢至 10s+，并发后总延迟取最慢者）。
+    返回 [{"time": "MM-DD HH:MM", "text": 摘要, "url": 链接, "src": 来源}, ...]，
+    新→旧排序、按内容去重。任一来源失败不影响另一个，全失败则抛异常。"""
+    cutoff = datetime.now() - timedelta(hours=NEWS_MAX_AGE_H)
+    items, errors = [], []
+    lock = threading.Lock()
+
+    def fetch_sina():
+        try:
+            req = urllib.request.Request(SINA_FEED_URL, headers=NEWS_HEADERS)
+            with urllib.request.urlopen(req, timeout=8, context=SSL_CONTEXT) as resp:
+                d = json.loads(resp.read().decode("utf-8", "ignore"))
+            rows = ((((d.get("result") or {}).get("data") or {}).get("feed") or {})
+                    .get("list") or [])
+            local = []
+            for r in rows:
+                text = _strip_html(r.get("rich_text", ""))
+                tstr = r.get("create_time", "")
+                if not text or not tstr:
+                    continue
+                try:
+                    dt = datetime.strptime(tstr, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if dt < cutoff or not _news_relevant(text):
+                    continue
+                local.append({"time": dt.strftime("%m-%d %H:%M"), "text": text,
+                              "url": r.get("docurl") or "", "src": "新浪"})
+            with lock:
+                items.extend(local)
+        except Exception as e:
+            with lock:
+                errors.append("sina:%s" % e)
+
+    def fetch_em():
+        try:
+            req = urllib.request.Request(EM_NEWS_URL, headers={
+                "User-Agent": NEWS_HEADERS["User-Agent"],
+                "Referer": "https://kuaixun.eastmoney.com/"})
+            with urllib.request.urlopen(req, timeout=8, context=SSL_CONTEXT) as resp:
+                d = json.loads(resp.read().decode("utf-8", "ignore"))
+            local = []
+            for r in (d.get("data") or {}).get("list") or []:
+                text = (r.get("title") or "").strip()
+                tstr = r.get("showTime") or ""
+                if not text or not tstr:
+                    continue
+                try:
+                    dt = datetime.strptime(tstr, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if dt < cutoff or not _news_relevant(text):
+                    continue
+                local.append({"time": dt.strftime("%m-%d %H:%M"), "text": text,
+                              "url": r.get("url") or r.get("uniqueUrl") or "",
+                              "src": "东财"})
+            with lock:
+                items.extend(local)
+        except Exception as e:
+            with lock:
+                errors.append("em:%s" % e)
+
+    t1 = threading.Thread(target=fetch_sina)
+    t2 = threading.Thread(target=fetch_em)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    if not items and errors:
+        raise RuntimeError(";".join(errors))
+    # 按正文前 20 字去重（同一条快讯两家都转），保留先到的（新浪优先）
+    seen, uniq = set(), []
+    for it in items:
+        key = it["text"][:20]
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(it)
+    uniq.sort(key=lambda x: x["time"], reverse=True)
+    return uniq[:50]
+
+
+
 def daily_pl_rows(settles, est_daily, trades, total_grams,
                   live_sell=None, today=None, now_hm=None):
     """根据每晚 22:20 日结价与买入明细，逐日重算每日盈亏（支付宝同口径）。
@@ -1225,8 +1351,21 @@ class GoldMonitorApp:
         self._em_loading = set()  # 正在后台拉取的 key，避免重复请求
         self._chart_seq = 0  # 走势图绘制代际令牌，丢弃切模式前在途的在线回调
 
+        # 底部黄金快讯跑马灯
+        self._news_items = []      # [{"time","text","url","src"}] 新→旧
+        self._news_x = 0           # 跑马灯当前 x 偏移
+        self._news_text_w = 0      # 滚动文本总宽
+        self._news_paused = False  # 鼠标悬停暂停
+        self._news_loading = False
+        self._news_loaded_once = False
+        self._news_font = tkfont.Font(family=FONT, size=9)
+        self._news_list_win = None
+        self._news_gen = 0       # 跑马灯代际：UI 重建后旧定时链自行作废
+
         self._build_ui()
         self._fit_window()
+        # 开机自启/隐藏启动时首次几何计算可能偏小，窗口真正显示后再拟合一次
+        self.root.after(800, self._fit_window)
         self._build_tray()
 
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
@@ -1483,6 +1622,10 @@ class GoldMonitorApp:
         self.autostart_var = tk.BooleanVar(value=self.cfg["autostart"])
         dark_checkbutton(checks, "开机自动启动（一起床就看盘）", self.autostart_var,
                          bg=C_CARD, command=self._on_autostart).pack(anchor="w", pady=2)
+        self.news_bar_var = tk.BooleanVar(value=self.cfg.get("news_bar", True))
+        dark_checkbutton(checks, "底部滚动黄金快讯（新浪/东财）", self.news_bar_var,
+                         bg=C_CARD, command=self._on_news_bar_toggle).pack(
+            anchor="w", pady=2)
 
         # 底部操作
         btns = tk.Frame(body, bg=C_BG)
@@ -1497,6 +1640,192 @@ class GoldMonitorApp:
         tk.Label(body, textvariable=self.status_var, bg=C_BG, fg=C_TXT_3,
                 font=(FONT, 8), wraplength=380, justify="left").pack(
             anchor="w", padx=PAD, pady=(5, 8))
+
+        self._build_news_bar(body)
+
+    def _build_news_bar(self, parent):
+        """底部黄金快讯跑马灯：悬停暂停、点击打开快讯列表。"""
+        bar = tk.Frame(parent, bg=C_CARD, highlightbackground=C_LINE,
+                       highlightthickness=1)
+        head = tk.Frame(bar, bg=C_CARD)
+        head.pack(fill="x", padx=10, pady=(5, 0))
+        tk.Frame(head, bg=C_GOLD, width=3, height=12).pack(side="left", padx=(0, 6))
+        tk.Label(head, text="黄金快讯", bg=C_CARD, fg=C_GOLD_HI,
+                font=(FONT, 9, "bold")).pack(side="left")
+        self._news_count_var = tk.StringVar(value="")
+        tk.Label(head, textvariable=self._news_count_var, bg=C_CARD, fg=C_TXT_3,
+                font=(FONT, 8)).pack(side="left", padx=(6, 0))
+        tk.Label(head, text="悬停暂停 · 点击看全部", bg=C_CARD, fg=C_TXT_3,
+                font=(FONT, 8)).pack(side="right")
+        self._news_cv = tk.Canvas(bar, height=26, bg=C_CARD, highlightthickness=0)
+        self._news_cv.pack(fill="x", padx=8, pady=(2, 5))
+        self._news_cv.bind("<Enter>", lambda e: setattr(self, "_news_paused", True))
+        self._news_cv.bind("<Leave>", lambda e: setattr(self, "_news_paused", False))
+        self._news_cv.bind("<Button-1>", lambda e: self._open_news_list())
+        self._news_cv.configure(cursor="hand2")
+        if self.cfg.get("news_bar", True):
+            bar.pack(fill="x", padx=16, pady=(0, 10), side="bottom")
+            self._news_gen += 1
+            self._news_cv.after(600, lambda g=self._news_gen: self._news_loop(g))
+            self._news_cv.after(600, lambda g=self._news_gen: self._news_tick(g))
+
+    # ---- 黄金快讯跑马灯 ----
+    def _on_news_bar_toggle(self):
+        self.cfg["news_bar"] = bool(self.news_bar_var.get())
+        self._persist()
+        # 重建主界面以增删底部跑马灯
+        self._news_gen += 1
+        self.body.destroy()
+        self._build_ui()
+        self._fit_window()
+        self._refresh_view_from_cache()
+
+    def _news_loop(self, gen):
+        """定时后台拉取快讯；仅在当前代际且开启时运转。"""
+        if gen != self._news_gen or not self.cfg.get("news_bar", True):
+            return
+        if not self._news_loading:
+            self._news_loading = True
+
+            def work():
+                data, err = None, None
+                try:
+                    data = fetch_gold_news()
+                except Exception as e:
+                    err = e
+
+                def ui():
+                    self._news_loading = False
+                    if gen != self._news_gen:
+                        return
+                    if err is None:
+                        self._news_loaded_once = True
+                        # 已有滚动状态且新列表首条未变时，静默替换不打断滚动
+                        first_changed = (not self._news_items or
+                                         not data or
+                                         self._news_items[0]["text"] != data[0]["text"])
+                        self._news_items = data
+                        self._news_count_var.set(
+                            "近 %d 条" % len(data) if data else "")
+                        if first_changed:
+                            self._news_reset_scroll()
+                        else:
+                            self._news_render()
+                    elif not self._news_items:
+                        self._news_draw_hint("快讯获取失败，5 分钟后重试…")
+                self.root.after(0, ui)
+
+            threading.Thread(target=work, daemon=True).start()
+        self.root.after(NEWS_REFRESH_SEC * 1000,
+                        lambda: self._news_loop(gen))
+
+    def _news_segments(self):
+        """拼成滚动文本：各条之间用金色菱形分隔；超长条目截断。"""
+        parts, gap = [], "    ◆    "
+        for n in self._news_items:
+            t = n["text"]
+            if len(t) > 90:
+                t = t[:90] + "…"
+            parts.append("%s %s" % (n["time"][5:], t))
+        return gap.join(parts), gap
+
+    def _news_reset_scroll(self):
+        self._news_text_w = self._news_font.measure(
+            self._news_segments()[0]) if self._news_items else 0
+        w = self._news_cv.winfo_width() or 388
+        self._news_x = w  # 从右侧滚入
+        self._news_render()
+
+    def _news_render(self):
+        cv = self._news_cv
+        cv.delete("all")
+        if not self._news_items:
+            self._news_draw_hint("正在获取黄金快讯…"
+                                 if not self._news_loaded_once else "暂无黄金相关快讯")
+            return
+        text, _ = self._news_segments()
+        cv.create_text(self._news_x, 13, text=text, anchor="w",
+                       fill=C_TXT, font=(FONT, 9))
+        if not self._news_paused:
+            self._news_x -= 1
+            w = cv.winfo_width() or 388
+            if self._news_x + self._news_text_w < 0:
+                self._news_x = w
+
+    def _news_tick(self, gen):
+        """唯一的 40ms 动画心跳：代际匹配才重绘并续期，避免多条滚动链。"""
+        if gen != self._news_gen or not self.cfg.get("news_bar", True):
+            return
+        self._news_render()
+        self.root.after(40, lambda: self._news_tick(gen))
+
+    def _news_draw_hint(self, text):
+        cv = self._news_cv
+        cv.delete("all")
+        cv.create_text((cv.winfo_width() or 388) // 2, 13, text=text,
+                       fill=C_TXT_3, font=(FONT, 9))
+
+    def _open_news_list(self):
+        """快讯列表面板：可回看、点条目打开原文。"""
+        if self._news_list_win is not None:
+            try:
+                if tk.Toplevel.winfo_exists(self._news_list_win):
+                    self._news_list_win.lift()
+                    return
+            except Exception:
+                pass
+        win = tk.Toplevel(self.root)
+        self._news_list_win = win
+        win.title("黄金快讯（近 %d 小时）" % NEWS_MAX_AGE_H)
+        win.configure(bg=C_BG)
+        win.geometry("460x520")
+        win.transient(self.root)
+
+        def on_close():
+            self._news_list_win = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+        tk.Label(win, text="黄金相关快讯（新浪财经 7x24 / 东财，每 5 分钟自动刷新）",
+                 bg=C_BG, fg=C_TXT_2, font=(FONT, 9)).pack(
+            anchor="w", padx=14, pady=(12, 6))
+        box = tk.Frame(win, bg=C_CARD, highlightbackground=C_LINE,
+                       highlightthickness=1)
+        box.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        txt = tk.Text(box, wrap="word", bd=0, bg=C_CARD, fg=C_TXT,
+                      font=(FONT, 9), padx=12, pady=10, spacing1=2,
+                      spacing3=8, cursor="arrow", height=20)
+        vsb = ttk.Scrollbar(box, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set, state="disabled")
+        vsb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+
+        def render():
+            if not win.winfo_exists():
+                return
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            if not self._news_items:
+                txt.insert("end", "\n暂无快讯（可能正在获取或网络不可用）。")
+            for i, n in enumerate(self._news_items):
+                tag = "n%d" % i
+                head = "%s  [%s]\n" % (n["time"], n["src"])
+                txt.insert("end", head)
+                txt.insert("end", n["text"] + "\n\n", tag)
+                txt.tag_configure(tag, foreground=C_GOLD_HI if n["url"] else C_TXT,
+                                  font=(FONT, 9, "underline" if n["url"] else "normal"))
+                if n["url"]:
+                    txt.tag_bind(tag, "<Button-1>",
+                                 lambda e, u=n["url"]: webbrowser.open(u))
+                    txt.tag_bind(tag, "<Enter>",
+                                 lambda e: txt.configure(cursor="hand2"))
+                    txt.tag_bind(tag, "<Leave>",
+                                 lambda e: txt.configure(cursor="arrow"))
+            txt.configure(state="disabled")
+
+        render()
+        ttk.Button(win, text="关闭", command=on_close).pack(pady=(0, 12))
+
 
     def _toggle_theme(self):
         new_name = "light" if THEME_NAME == "dark" else "dark"
