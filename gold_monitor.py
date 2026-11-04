@@ -130,6 +130,7 @@ DEFAULT_CONFIG = {
     "plans": [],
     "theme": "dark",            # 界面主题：dark（黑金暗色）/ light（浅色日间）
     "news_bar": True,           # 底部黄金快讯跑马灯
+    "settings_open": False,     # 监控设置卡片是否展开（默认折叠，窗口更短）
 }
 
 # 个人积存金赎回（卖出变现）手续费率：赎回金额的 0.5%（工行 2017-03-01 起，
@@ -1574,13 +1575,29 @@ class GoldMonitorApp:
                        highlightthickness=1)
         box.pack(fill="x", padx=PAD, pady=8)
 
-        bhead = tk.Frame(box, bg=C_CARD)
-        bhead.pack(fill="x", padx=16, pady=(11, 2))
-        tk.Frame(bhead, bg=C_GOLD, width=3, height=13).pack(side="left", padx=(0, 7))
+        bhead = tk.Frame(box, bg=C_CARD, cursor="hand2")
+        bhead.pack(fill="x", padx=16, pady=(11, 6))
+        self._settings_arrow_var = tk.StringVar(
+            value="▾" if self.cfg.get("settings_open", False) else "▸")
+        tk.Label(bhead, textvariable=self._settings_arrow_var, bg=C_CARD,
+                 fg=C_GOLD, font=(FONT, 10, "bold")).pack(side="left", padx=(0, 7))
         tk.Label(bhead, text="监控设置", bg=C_CARD, fg=C_TXT,
                  font=(FONT, 10, "bold")).pack(side="left")
+        self._settings_hint_var = tk.StringVar(
+            value="点击收起" if self.cfg.get("settings_open", False) else "点击展开")
+        tk.Label(bhead, textvariable=self._settings_hint_var, bg=C_CARD,
+                 fg=C_TXT_3, font=(FONT, 8)).pack(side="right")
+        # 标题行任意位置（含子标签）点击均可折叠/展开
+        for w in (bhead,) + tuple(bhead.winfo_children()):
+            w.bind("<Button-1>", self._toggle_settings)
 
-        grid = tk.Frame(box, bg=C_CARD)
+        # grid/checks 挂在可整体隐藏的 inner 上，折叠时收起、窗口随之变短
+        inner = tk.Frame(box, bg=C_CARD)
+        self._settings_inner = inner
+        if self.cfg.get("settings_open", False):
+            inner.pack(fill="x")
+
+        grid = tk.Frame(inner, bg=C_CARD)
         grid.pack(fill="x", padx=16, pady=(4, 4))
         grid.grid_columnconfigure(1, weight=1)
 
@@ -1609,7 +1626,7 @@ class GoldMonitorApp:
                     textvariable=self.interval_var).grid(
             row=2, column=1, sticky="w", padx=(12, 0))
 
-        checks = tk.Frame(box, bg=C_CARD)
+        checks = tk.Frame(inner, bg=C_CARD)
         checks.pack(fill="x", padx=14, pady=(2, 10))
         self.sound_var = tk.BooleanVar(value=self.cfg["sound"])
         dark_checkbutton(checks, "破位时播放提示音", self.sound_var,
@@ -1670,6 +1687,20 @@ class GoldMonitorApp:
             self._news_cv.after(600, lambda g=self._news_gen: self._news_tick(g))
 
     # ---- 黄金快讯跑马灯 ----
+    def _toggle_settings(self, _event=None):
+        """监控设置卡片折叠/展开：低频设置收起后窗口明显变短。"""
+        opened = not self.cfg.get("settings_open", False)
+        self.cfg["settings_open"] = opened
+        self._persist()
+        self._settings_arrow_var.set("▾" if opened else "▸")
+        self._settings_hint_var.set("点击收起" if opened else "点击展开")
+        if opened:
+            self._settings_inner.pack(fill="x")
+        else:
+            self._settings_inner.pack_forget()
+        self.root.update_idletasks()
+        self._fit_window()
+
     def _on_news_bar_toggle(self):
         self.cfg["news_bar"] = bool(self.news_bar_var.get())
         self._persist()
