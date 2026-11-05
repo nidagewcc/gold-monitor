@@ -118,7 +118,18 @@ DEFAULT_CONFIG = {
     "plans": [],
     "theme": "light",           # 界面主题：light（轻奢米金·昼，主打）/ dark（轻奢米金·夜）
     "settings_open": False,     # 监控设置卡片是否展开（默认折叠，窗口更短）
+    # 微信推送（公众平台测试号 template/send）：桌面端直连 api.weixin.qq.com，
+    # 无需公网服务器/备案域名；仅在破档/补仓到价时推送价格信息，不含持仓金额
+    "wx_enabled": False,        # 总开关
+    "wx_appid": "",             # 测试号 appID
+    "wx_secret": "",            # 测试号 appsecret
+    "wx_openid": "",            # 关注测试号后得到的 openid
+    "wx_template_id": "",       # 测试模板 ID（模板内容需含 {{content.DATA}}）
 }
+
+# 微信公众平台测试号（sandbox）：个人主体也能调模板消息，纯服务端 HTTPS 调用
+WX_SANDBOX_URL = "https://mp.weixin.qq.com/debug/cgi-bin/sandbox?t=sandbox/login"
+WX_API_BASE = "https://api.weixin.qq.com"
 
 # 个人积存金赎回（卖出变现）手续费率：赎回金额的 0.5%（工行 2017-03-01 起，
 # 2026-08-28 阶段性优惠公告明确该费率保持 0.5% 不变）
@@ -520,6 +531,70 @@ def fetch_prices():
         pass
 
     return result
+
+
+# ---------- 微信推送（公众平台测试号） ----------
+
+class WeChatPusher:
+    """测试号模板消息推送：access_token 内存缓存（有效期 7200 秒，提前 5 分钟刷新）。
+    所有方法均为阻塞式网络调用，调用方需自行放到后台线程。"""
+
+    def __init__(self):
+        self._token = ""
+        self._token_exp = 0.0
+        self._lock = threading.Lock()
+
+    def configured(self, cfg):
+        return all(str(cfg.get(k) or "").strip() for k in
+                   ("wx_appid", "wx_secret", "wx_openid", "wx_template_id"))
+
+    def _get_token(self, cfg):
+        with self._lock:
+            if self._token and time.time() < self._token_exp:
+                return self._token
+            url = (f"{WX_API_BASE}/cgi-bin/token?grant_type=client_credential"
+                   f"&appid={urllib.parse.quote(cfg['wx_appid'].strip())}"
+                   f"&secret={urllib.parse.quote(cfg['wx_secret'].strip())}")
+            req = urllib.request.Request(url, headers={"User-Agent": HEADERS["User-Agent"]})
+            with urllib.request.urlopen(req, timeout=10, context=SSL_CONTEXT) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+            if "access_token" not in d:
+                raise RuntimeError(f"获取 access_token 失败：{d.get('errmsg') or d}（errcode={d.get('errcode')}）")
+            self._token = d["access_token"]
+            self._token_exp = time.time() + int(d.get("expires_in", 7200)) - 300
+            return self._token
+
+    def send(self, cfg, content):
+        """发送一条模板消息。成功返回 None，失败返回中文错误串。"""
+        if not self.configured(cfg):
+            return "微信推送参数不完整（appID/appsecret/openid/模板ID 都要填）"
+        try:
+            token = self._get_token(cfg)
+            payload = {
+                "touser": cfg["wx_openid"].strip(),
+                "template_id": cfg["wx_template_id"].strip(),
+                # 测试号模板必须带前缀文案，不能只放 {{content.DATA}}
+                "data": {"content": {"value": content, "color": "#9c6b1f"}},
+            }
+            url = f"{WX_API_BASE}/cgi-bin/message/template/send?access_token={token}"
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8",
+                         "User-Agent": HEADERS["User-Agent"]},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10, context=SSL_CONTEXT) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+            if d.get("errcode", 0) != 0:
+                # token 失效时清缓存，下次发送自动重新获取
+                if d.get("errcode") in (40001, 40014, 42001):
+                    with self._lock:
+                        self._token, self._token_exp = "", 0.0
+                return f"微信接口返回错误：{d.get('errmsg')}（errcode={d.get('errcode')}）"
+            return None
+        except Exception as e:
+            return f"微信推送失败：{e}"
 
 
 # ---------- 配置 ----------
@@ -1291,6 +1366,10 @@ class GoldMonitorApp:
         self._news_last_fetch = 0.0  # 上次成功拉取时间戳（弹窗内节流）
         self._news_last_ok = ""      # 上次成功拉取的 "HH:MM"（弹窗副标题展示）
 
+        # 微信测试号推送：token 缓存挂在实例上，配置存 config.json
+        self._wx_pusher = WeChatPusher()
+        self._wx_busy = False        # 测试推送进行中（防连点）
+
         self._build_ui()
         self._fit_window()
         # 开机自启/隐藏启动时首次几何计算可能偏小，窗口真正显示后再拟合一次
@@ -1571,6 +1650,16 @@ class GoldMonitorApp:
         self.autostart_var = tk.BooleanVar(value=self.cfg["autostart"])
         dark_checkbutton(checks, "开机自动启动（一起床就看盘）", self.autostart_var,
                          bg=C_CARD, command=self._on_autostart).pack(anchor="w", pady=2)
+
+        # 微信推送：一行显示开关状态 + 配置入口
+        wxrow = tk.Frame(inner, bg=C_CARD)
+        wxrow.pack(fill="x", padx=14, pady=(6, 4))
+        self._wx_state_var = tk.StringVar()
+        tk.Label(wxrow, textvariable=self._wx_state_var, bg=C_CARD,
+                 fg=C_TXT_2, font=(FONT, 9)).pack(side="left")
+        ttk.Button(wxrow, text="微信推送设置",
+                   command=self._open_wx_settings).pack(side="right")
+        self._refresh_wx_state()
 
         # 底部操作
         btns = tk.Frame(body, bg=C_BG)
@@ -1862,6 +1951,13 @@ class GoldMonitorApp:
             except Exception:
                 pass
             self._news_list_win = None
+        # 微信推送设置窗同理，避免残留旧配色
+        if getattr(self, "_wx_win", None) is not None:
+            try:
+                self._wx_win.destroy()
+            except Exception:
+                pass
+            self._wx_win = None
         apply_dark_style(self.root)
         self.root.configure(bg=C_BG)
         self.body.destroy()
@@ -3915,6 +4011,8 @@ class GoldMonitorApp:
                 self.tray.notify(g_txt, title)
             except Exception:
                 pass
+        # 微信推送：只含计划价/克数，不含持仓成本
+        self._wx_push_async(title, f"当前买入 {buy:.2f} 元/克\n{g_txt}")
 
     def _open_plans(self):
         """补仓计划管理窗：目标买入价 + 计划克数，走势图同步画蓝色虚线。"""
@@ -4094,6 +4192,11 @@ class GoldMonitorApp:
             except Exception:
                 pass
 
+        # 微信推送：只含价格档位，不含持仓/盈亏
+        push_title = "金价涨破档位" if up else "金价跌破档位"
+        push_content = f"{name}\n当前 {price:.2f} {unit}\n{lines}"
+        self._wx_push_async(push_title, push_content)
+
     def _test_alert(self):
         self.toasts.show(
             "金价跳水现场（测试弹）",
@@ -4106,6 +4209,156 @@ class GoldMonitorApp:
                 winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
             except Exception:
                 self.root.bell()
+
+    # ---- 微信推送（公众平台测试号） ----
+    def _refresh_wx_state(self):
+        if not hasattr(self, "_wx_state_var"):
+            return
+        if self.cfg.get("wx_enabled") and self._wx_pusher.configured(self.cfg):
+            self._wx_state_var.set("手机微信推送：已开启")
+        elif self._wx_pusher.configured(self.cfg):
+            self._wx_state_var.set("手机微信推送：已配置，未开启")
+        else:
+            self._wx_state_var.set("手机微信推送：未配置")
+
+    def _wx_push_async(self, title, content):
+        """后台线程发送微信推送，失败只落日志/状态栏，绝不影响本地提醒。"""
+        if not (self.cfg.get("wx_enabled") and self._wx_pusher.configured(self.cfg)):
+            return
+        cfg_snapshot = {k: self.cfg.get(k, "") for k in
+                        ("wx_appid", "wx_secret", "wx_openid", "wx_template_id")}
+
+        def work():
+            err = self._wx_pusher.send(cfg_snapshot, f"{title}\n{content}")
+            if err:
+                log_error("微信推送", (RuntimeError(err), RuntimeError(err), None))
+                try:
+                    self.root.after(0, lambda: self.status_var.set(
+                        f"[{datetime.now():%H:%M}] {err}，本地提醒不受影响"))
+                except Exception:
+                    pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_wx_settings(self):
+        win = getattr(self, "_wx_win", None)
+        if win is not None and tk.Toplevel.winfo_exists(win):
+            win.lift()
+            win.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        self._wx_win = win
+        win.title("微信推送设置")
+        win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
+        win.geometry("520x505")
+        win.minsize(480, 470)
+        win.configure(bg=C_BG)
+        win.transient(self.root)
+
+        tk.Label(win, text="微信推送（公众平台测试号）", bg=C_BG, fg=C_GOLD_HI,
+                 font=(FONT, 12, "bold")).pack(anchor="w", padx=16, pady=(14, 2))
+        tip = ("用微信扫码申请测试号 → 关注测试号二维码拿 openid → 新建测试模板，\n"
+               "把页面上的四个值填到下面。桌面程序直连微信接口，不需要服务器和域名。")
+        tk.Label(win, text=tip, bg=C_BG, fg=C_TXT_2,
+                 font=(FONT, 8), justify="left").pack(anchor="w", padx=16)
+        link = tk.Label(win, text="点这里打开测试号申请页（mp.weixin.qq.com）",
+                        bg=C_BG, fg=C_GOLD, font=(FONT, 8, "underline"), cursor="hand2")
+        link.pack(anchor="w", padx=16, pady=(3, 8))
+        link.bind("<Button-1>", lambda _e: webbrowser.open(WX_SANDBOX_URL))
+
+        form = tk.Frame(win, bg=C_BG)
+        form.pack(fill="x", padx=16)
+        form.grid_columnconfigure(1, weight=1)
+        vars_ = {}
+        rows = [
+            ("wx_appid", "appID"),
+            ("wx_secret", "appsecret"),
+            ("wx_openid", "openid（微信号）"),
+            ("wx_template_id", "模板ID"),
+        ]
+        for r, (key, label) in enumerate(rows):
+            tk.Label(form, text=label, bg=C_BG, fg=C_TXT,
+                     font=(FONT, 9)).grid(row=r, column=0, sticky="w", pady=5, padx=(0, 8))
+            v = tk.StringVar(value=str(self.cfg.get(key) or ""))
+            vars_[key] = v
+            ttk.Entry(form, textvariable=v, show="*" if key == "wx_secret" else ""
+                      ).grid(row=r, column=1, sticky="ew", pady=5)
+
+        tpl_tip = ("模板内容请填：金价提醒: {{content.DATA}}\n"
+                   "（测试号模板不能只写 {{content.DATA}}，必须带前缀文案，变量名要叫 content）")
+        tk.Label(win, text=tpl_tip, bg=C_BG, fg=C_TXT_3,
+                 font=(FONT, 8), justify="left").pack(anchor="w", padx=16, pady=(6, 2))
+        tk.Label(win, text="推送只含价格与档位信息，不含持仓克数、成本和盈亏。",
+                 bg=C_BG, fg=C_TXT_3, font=(FONT, 8)).pack(anchor="w", padx=16)
+
+        enable_var = tk.BooleanVar(value=bool(self.cfg.get("wx_enabled")))
+        dark_checkbutton(win, "开启微信推送（破档 / 补仓到价时发到手机）", enable_var,
+                         bg=C_BG).pack(anchor="w", padx=14, pady=(10, 4))
+
+        result_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=result_var, bg=C_BG, fg=C_TXT_2,
+                 font=(FONT, 9), wraplength=470, justify="left").pack(
+            anchor="w", padx=16, pady=(6, 0))
+
+        def collect():
+            return {k: vars_[k].get().strip() for k, _ in rows}
+
+        def save():
+            vals = collect()
+            self.cfg.update(vals)
+            self.cfg["wx_enabled"] = bool(enable_var.get())
+            save_config(self.cfg)
+            self._refresh_wx_state()
+            self.status_var.set(
+                f"[{datetime.now():%H:%M}] 微信推送设置已保存（{'已开启' if enable_var.get() else '未开启'}）")
+
+        def do_test():
+            if self._wx_busy:
+                return
+            vals = collect()
+            if not all(vals.values()):
+                messagebox.showwarning("微信推送", "四个参数都要填齐再测试。", parent=win)
+                return
+            self._wx_busy = True
+            result_var.set("正在发送测试消息，请留意微信通知…")
+            test_btn.configure(state="disabled")
+
+            def work():
+                err = self._wx_pusher.send(
+                    vals,
+                    f"测试推送\n这是来自{APP_NAME}的演习消息，收到说明配置成功。")
+
+                def ui():
+                    self._wx_busy = False
+                    try:
+                        test_btn.configure(state="normal")
+                    except Exception:
+                        pass
+                    if err:
+                        result_var.set(err)
+                        log_error("微信测试推送", (RuntimeError(err), RuntimeError(err), None))
+                    else:
+                        result_var.set("发送成功！请查看微信服务通知（测试号消息可能折叠在订阅号里）。")
+
+                try:
+                    self.root.after(0, ui)
+                except Exception:
+                    pass
+
+            threading.Thread(target=work, daemon=True).start()
+
+        btns = tk.Frame(win, bg=C_BG)
+        btns.pack(fill="x", padx=16, pady=14)
+        ttk.Button(btns, text="保存", style="Gold.TButton",
+                   command=save).pack(side="left")
+        test_btn = ttk.Button(btns, text="保存并测试推送", command=lambda: (save(), do_test()))
+        test_btn.pack(side="left", padx=10)
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(side="right")
+
+        def on_close():
+            self._wx_win = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", on_close)
 
     def _schedule_next(self):
         try:
