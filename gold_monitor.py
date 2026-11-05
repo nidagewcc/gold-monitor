@@ -4011,8 +4011,11 @@ class GoldMonitorApp:
                 self.tray.notify(g_txt, title)
             except Exception:
                 pass
-        # 微信推送：只含计划价/克数，不含持仓成本
-        self._wx_push_async(title, f"当前买入 {buy:.2f} 元/克\n{g_txt}")
+        # 微信推送：目标价/买入价/补仓克数金额 + 持仓浮盈
+        parts = [f"计划目标价 {target:g} 元/克",
+                 f"当前买入 {buy:.2f} 元/克", g_txt]
+        parts.extend(self._holding_summary_lines())
+        self._wx_push_async(title, "\n".join(parts))
 
     def _open_plans(self):
         """补仓计划管理窗：目标买入价 + 计划克数，走势图同步画蓝色虚线。"""
@@ -4192,10 +4195,11 @@ class GoldMonitorApp:
             except Exception:
                 pass
 
-        # 微信推送：只含价格档位，不含持仓/盈亏
+        # 微信推送：价格档位 + 持仓成本 + 实时浮盈（隐私模式自动打码）
         push_title = "金价涨破档位" if up else "金价跌破档位"
-        push_content = f"{name}\n当前 {price:.2f} {unit}\n{lines}"
-        self._wx_push_async(push_title, push_content)
+        parts = [f"{name} 当前 {price:.2f} {unit}", lines]
+        parts.extend(self._holding_summary_lines())
+        self._wx_push_async(push_title, "\n".join(parts))
 
     def _test_alert(self):
         self.toasts.show(
@@ -4211,6 +4215,24 @@ class GoldMonitorApp:
                 self.root.bell()
 
     # ---- 微信推送（公众平台测试号） ----
+    def _holding_summary_lines(self):
+        """构造持仓多行摘要（按赎回价实时浮盈）；隐私模式金额打码，无持仓返回空列表。"""
+        grams = float(self.cfg.get("hold_grams") or 0)
+        cost = float(self.cfg.get("hold_cost") or 0)
+        if grams <= 0 or cost <= 0:
+            return []
+        avg = cost / grams
+        sell = self._latest_sell
+        if self.cfg.get("privacy"):
+            return [f"持仓 {grams:g} 克｜成本均价 **** 元/克",
+                    "当前浮盈 **** 元"]
+        lines = [f"持仓 {grams:g} 克｜成本均价 {avg:.2f} 元/克"]
+        if sell:
+            pl = grams * sell - cost
+            pct = pl / cost * 100
+            lines.append(f"当前浮盈 {pl:+,.2f} 元（{pct:+.2f}%）")
+        return lines
+
     def _refresh_wx_state(self):
         if not hasattr(self, "_wx_state_var"):
             return
@@ -4288,7 +4310,7 @@ class GoldMonitorApp:
                    "（测试号模板不能只写 {{content.DATA}}，必须带前缀文案，变量名要叫 content）")
         tk.Label(win, text=tpl_tip, bg=C_BG, fg=C_TXT_3,
                  font=(FONT, 8), justify="left").pack(anchor="w", padx=16, pady=(6, 2))
-        tk.Label(win, text="推送只含价格与档位信息，不含持仓克数、成本和盈亏。",
+        tk.Label(win, text="推送含价格档位、持仓克数、成本均价与实时浮盈；开启隐私模式后金额自动打码。",
                  bg=C_BG, fg=C_TXT_3, font=(FONT, 8)).pack(anchor="w", padx=16)
 
         enable_var = tk.BooleanVar(value=bool(self.cfg.get("wx_enabled")))
@@ -4324,9 +4346,20 @@ class GoldMonitorApp:
             test_btn.configure(state="disabled")
 
             def work():
-                err = self._wx_pusher.send(
-                    vals,
-                    f"测试推送\n这是来自{APP_NAME}的演习消息，收到说明配置成功。")
+                # 用真实最新价构造一条模拟破档消息，验证多行排版（含持仓/浮盈）
+                demo_price = self.last_price or 0.0
+                unit = SOURCES[self.cfg["source"]]["unit"]
+                if demo_price:
+                    demo_body = "\n".join([
+                        f"{SOURCES[self.cfg['source']]['name']} 当前 {demo_price:.2f} {unit}",
+                        "跌破 {0:g} 元（模拟档位）".format(round(demo_price + 5)),
+                    ] + self._holding_summary_lines())
+                else:
+                    demo_body = "\n".join([
+                        f"{SOURCES[self.cfg['source']]['name']} 当前 880.00 {unit}",
+                        "跌破 890 元（模拟档位）",
+                    ] + self._holding_summary_lines())
+                err = self._wx_pusher.send(vals, f"测试推送（模拟破档）\n{demo_body}")
 
                 def ui():
                     self._wx_busy = False
