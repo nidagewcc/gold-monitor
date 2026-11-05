@@ -564,17 +564,24 @@ class WeChatPusher:
             self._token_exp = time.time() + int(d.get("expires_in", 7200)) - 300
             return self._token
 
-    def send(self, cfg, content):
-        """发送一条模板消息。成功返回 None，失败返回中文错误串。"""
+    def send(self, cfg, content_or_dict):
+        """发送一条模板消息。第二个参数可以是 str（单变量 content，向后兼容）或 dict（多变量）。"""
         if not self.configured(cfg):
             return "微信推送参数不完整（appID/appsecret/openid/模板ID 都要填）"
         try:
             token = self._get_token(cfg)
+            if isinstance(content_or_dict, dict):
+                # 多变量模板：dict 的键就是模板里的 {{xxx.DATA}} 变量名（不含 .DATA 后缀）
+                data = {}
+                for k, v in content_or_dict.items():
+                    data[k] = {"value": str(v) if v is not None else ""}
+            else:
+                # 单变量 content（旧模板兜底）
+                data = {"content": {"value": str(content_or_dict), "color": "#9c6b1f"}}
             payload = {
                 "touser": cfg["wx_openid"].strip(),
                 "template_id": cfg["wx_template_id"].strip(),
-                # 测试号模板必须带前缀文案，不能只放 {{content.DATA}}
-                "data": {"content": {"value": content, "color": "#9c6b1f"}},
+                "data": data,
             }
             url = f"{WX_API_BASE}/cgi-bin/message/template/send?access_token={token}"
             req = urllib.request.Request(
@@ -4011,11 +4018,17 @@ class GoldMonitorApp:
                 self.tray.notify(g_txt, title)
             except Exception:
                 pass
-        # 微信推送：目标价/买入价/补仓克数金额 + 持仓浮盈
-        parts = [f"计划目标价 {target:g} 元/克",
-                 f"当前买入 {buy:.2f} 元/克", g_txt]
-        parts.extend(self._holding_summary_lines())
-        self._wx_push_async(title, "\n".join(parts))
+        # 微信推送：多变量模板
+        holding_lines = self._holding_summary_lines()
+        push_dict = {
+            "header": f"补仓计划到价 {target:g} 元",
+            "price_line": f"当前买入 {buy:.2f} 元/克",
+            "tier_line": g_txt,
+            "holding_line": holding_lines[0] if holding_lines else "",
+            "pl_line": holding_lines[1] if len(holding_lines) > 1 else "",
+            "remark": "",
+        }
+        self._wx_push_async(push_dict)
 
     def _open_plans(self):
         """补仓计划管理窗：目标买入价 + 计划克数，走势图同步画蓝色虚线。"""
@@ -4195,11 +4208,18 @@ class GoldMonitorApp:
             except Exception:
                 pass
 
-        # 微信推送：价格档位 + 持仓成本 + 实时浮盈（隐私模式自动打码）
-        push_title = "金价涨破档位" if up else "金价跌破档位"
-        parts = [f"{name} 当前 {price:.2f} {unit}", lines]
-        parts.extend(self._holding_summary_lines())
-        self._wx_push_async(push_title, "\n".join(parts))
+        # 微信推送：多变量模板（每个 {{xxx.DATA}} 在卡片上独立一行，微信沙箱正确渲染）
+        holding_lines = self._holding_summary_lines()
+        tier_txt = "、".join(f"{t:g} 元" for t in tiers)
+        push_dict = {
+            "header": f"{name} {verb}",
+            "price_line": f"当前 {price:.2f} {unit}",
+            "tier_line": f"{verb} {tier_txt}",
+            "holding_line": holding_lines[0] if holding_lines else "",
+            "pl_line": holding_lines[1] if len(holding_lines) > 1 else "",
+            "remark": "",
+        }
+        self._wx_push_async(push_dict)
 
     def _test_alert(self):
         self.toasts.show(
@@ -4243,15 +4263,23 @@ class GoldMonitorApp:
         else:
             self._wx_state_var.set("手机微信推送：未配置")
 
-    def _wx_push_async(self, title, content):
-        """后台线程发送微信推送，失败只落日志/状态栏，绝不影响本地提醒。"""
+    def _wx_push_async(self, title_or_dict, content=None):
+        """后台线程发送微信推送。
+        调用方式一（旧，单变量模板）：_wx_push_async(title_str, content_str)
+        调用方式二（新，多变量模板）：_wx_push_async(data_dict)，此时 dict 的键就是模板变量名
+        """
         if not (self.cfg.get("wx_enabled") and self._wx_pusher.configured(self.cfg)):
             return
         cfg_snapshot = {k: self.cfg.get(k, "") for k in
                         ("wx_appid", "wx_secret", "wx_openid", "wx_template_id")}
+        if isinstance(title_or_dict, dict):
+            payload = title_or_dict
+        else:
+            # 旧路径兜底：拼回单变量
+            payload = f"{title_or_dict}\n{content}"
 
         def work():
-            err = self._wx_pusher.send(cfg_snapshot, f"{title}\n{content}")
+            err = self._wx_pusher.send(cfg_snapshot, payload)
             if err:
                 log_error("微信推送", (RuntimeError(err), RuntimeError(err), None))
                 try:
@@ -4346,20 +4374,25 @@ class GoldMonitorApp:
             test_btn.configure(state="disabled")
 
             def work():
-                # 用真实最新价构造一条模拟破档消息，验证多行排版（含持仓/浮盈）
+                # 多变量模板测试：用真实最新价+真实持仓构造模拟破档
                 demo_price = self.last_price or 0.0
                 unit = SOURCES[self.cfg["source"]]["unit"]
                 if demo_price:
-                    demo_body = "\n".join([
-                        f"{SOURCES[self.cfg['source']]['name']} 当前 {demo_price:.2f} {unit}",
-                        "跌破 {0:g} 元（模拟档位）".format(round(demo_price + 5)),
-                    ] + self._holding_summary_lines())
+                    verb = "跌破"
+                    tier_val = round(demo_price + 5)
                 else:
-                    demo_body = "\n".join([
-                        f"{SOURCES[self.cfg['source']]['name']} 当前 880.00 {unit}",
-                        "跌破 890 元（模拟档位）",
-                    ] + self._holding_summary_lines())
-                err = self._wx_pusher.send(vals, f"测试推送（模拟破档）\n{demo_body}")
+                    demo_price, verb, tier_val = 880.00, "跌破", 890
+                holding_lines = self._holding_summary_lines()
+                push_dict = {
+                    "header": "金价跌破 880 元（测试）" if not demo_price
+                              else f"{SOURCES[self.cfg['source']]['name']} 跌破",
+                    "price_line": f"当前 {demo_price:.2f} {unit}",
+                    "tier_line": f"跌破 {tier_val:g} 元（模拟档位）",
+                    "holding_line": holding_lines[0] if holding_lines else "",
+                    "pl_line": holding_lines[1] if len(holding_lines) > 1 else "",
+                    "remark": "—— 这是演习，钱还在 ——",
+                }
+                err = self._wx_pusher.send(vals, push_dict)
 
                 def ui():
                     self._wx_busy = False
