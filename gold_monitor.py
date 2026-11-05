@@ -4020,12 +4020,14 @@ class GoldMonitorApp:
                 pass
         # 微信推送：多变量模板
         holding_lines = self._holding_summary_lines()
+        now = f"{datetime.now():%H:%M}"
         push_dict = {
             "header": f"补仓计划到价 {target:g} 元",
             "price_line": f"当前买入 {buy:.2f} 元/克",
             "tier_line": g_txt,
             "holding_line": holding_lines[0] if holding_lines else "",
             "pl_line": holding_lines[1] if len(holding_lines) > 1 else "",
+            "time_line": now,
             "remark": "",
         }
         self._wx_push_async(push_dict)
@@ -4211,12 +4213,14 @@ class GoldMonitorApp:
         # 微信推送：多变量模板（每个 {{xxx.DATA}} 在卡片上独立一行，微信沙箱正确渲染）
         holding_lines = self._holding_summary_lines()
         tier_txt = "、".join(f"{t:g} 元" for t in tiers)
+        now = f"{datetime.now():%H:%M}"
         push_dict = {
             "header": f"{name} {verb}",
             "price_line": f"当前 {price:.2f} {unit}",
             "tier_line": f"{verb} {tier_txt}",
             "holding_line": holding_lines[0] if holding_lines else "",
             "pl_line": holding_lines[1] if len(holding_lines) > 1 else "",
+            "time_line": now,
             "remark": "",
         }
         self._wx_push_async(push_dict)
@@ -4235,23 +4239,50 @@ class GoldMonitorApp:
                 self.root.bell()
 
     # ---- 微信推送（公众平台测试号） ----
+    def _today_pl(self):
+        """取今日盈亏，与主界面持仓卡片同源（_daily_rows 最后一行）。
+        返回 (前缀, 盈亏值)：盘中为 ("实时", 金额)，盘后/周末为 ("收盘", 金额)；
+        日结基准未就绪（rows 为空/None）返回 None。"""
+        try:
+            rows = self._daily_rows()
+        except Exception:
+            return None
+        if not rows:
+            return None
+        last_d = max(rows)
+        info = rows[last_d]
+        prefix = "实时" if info.get("is_today") else "收盘"
+        return prefix, float(info["pl"])
+
     def _holding_summary_lines(self):
-        """构造持仓多行摘要（按赎回价实时浮盈）；隐私模式金额打码，无持仓返回空列表。"""
+        """构造持仓两行摘要：
+        第一行 持仓克数｜累计投入｜当前市值；
+        第二行 持有收益（累计总收益=市值-投入）+ 今日实时/收盘盈亏（与主界面同源）。
+        隐私模式金额打码，无持仓返回空列表。"""
         grams = float(self.cfg.get("hold_grams") or 0)
         cost = float(self.cfg.get("hold_cost") or 0)
         if grams <= 0 or cost <= 0:
             return []
-        avg = cost / grams
         sell = self._latest_sell
+        today = self._today_pl()
         if self.cfg.get("privacy"):
-            return [f"持仓 {grams:g} 克｜成本均价 **** 元/克",
-                    "当前浮盈 **** 元"]
-        lines = [f"持仓 {grams:g} 克｜成本均价 {avg:.2f} 元/克"]
+            today_part = f"｜{today[0]}盈亏 **** 元" if today else ""
+            return [f"持仓 {grams:g} 克｜投入 **** 元",
+                    f"持有收益 **** 元{today_part}"]
         if sell:
-            pl = grams * sell - cost
+            market_value = grams * sell
+            pl = market_value - cost  # 持有收益：累计总收益 = 当前市值 - 总投入
             pct = pl / cost * 100
-            lines.append(f"当前浮盈 {pl:+,.2f} 元（{pct:+.2f}%）")
-        return lines
+            # 今日盈亏（盘中实时、22:20 后/周末收盘口径），基准未就绪则不拼
+            today_part = (f"｜{today[0]}盈亏 {today[1]:+,.2f} 元"
+                          if today is not None else "")
+            return [f"持仓 {grams:g} 克｜投入 {cost:,.0f} 元｜市值 {market_value:,.0f} 元",
+                    f"持有收益 {pl:+,.2f} 元（{pct:+.2f}%）{today_part}"]
+        # 没有赎回价时只给投入与今日盈亏
+        today_part = (f"｜{today[0]}盈亏 {today[1]:+,.2f} 元"
+                      if today is not None else "")
+        return [f"持仓 {grams:g} 克｜投入 {cost:,.0f} 元",
+                f"持有收益 ——（等待行情）{today_part}"]
 
     def _refresh_wx_state(self):
         if not hasattr(self, "_wx_state_var"):
@@ -4383,6 +4414,7 @@ class GoldMonitorApp:
                 else:
                     demo_price, verb, tier_val = 880.00, "跌破", 890
                 holding_lines = self._holding_summary_lines()
+                now = f"{datetime.now():%H:%M}"
                 push_dict = {
                     "header": "金价跌破 880 元（测试）" if not demo_price
                               else f"{SOURCES[self.cfg['source']]['name']} 跌破",
@@ -4390,6 +4422,7 @@ class GoldMonitorApp:
                     "tier_line": f"跌破 {tier_val:g} 元（模拟档位）",
                     "holding_line": holding_lines[0] if holding_lines else "",
                     "pl_line": holding_lines[1] if len(holding_lines) > 1 else "",
+                    "time_line": now,
                     "remark": "—— 这是演习，钱还在 ——",
                 }
                 err = self._wx_pusher.send(vals, push_dict)
