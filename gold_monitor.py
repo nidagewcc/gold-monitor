@@ -819,20 +819,23 @@ def daily_pl_rows(settles, est_daily, trades, total_grams,
     settles:  {"YYYY-MM-DD": 日结价} 精确价（工行22:20截止自报价/支付宝截图反推）
     est_daily: [["YYYY-MM-DD", 开, 收, 高, 低], ...] 黄金9999日K，仅用于无日结价的
                早期日期近似（凌晨收盘口径，误差较大，行上标 est=True）
-    trades:   [{"dt": "YYYY-MM-DD HH:MM", "grams": g, "amount": a}, ...]（均为买入）
-    total_grams: 当前总持仓克数；底仓 = 总持仓 − 明细合计（早于所有记录交易的存量）
+    trades:   [{"dt": "YYYY-MM-DD HH:MM", "grams": g, "amount": a,
+                "side": "buy"|"sell"}, ...]（side 缺省视为买入；sell 为减仓）
+    total_grams: 当前总持仓克数；底仓 = 总持仓 − 净买入合计（早于所有记录交易的存量）
     live_sell: 最新工行积存金赎回价。盘中（now_hm < 22:20）且 today 已有日结基准时，
                “今日”一行按实时盈亏计算（昨夜日结价→实时赎回价）；22:20 后日结价
                已生成，则按日结价显示“收盘”。
     today:    实时盈亏所属交易日（"YYYY-MM-DD"），默认取序列最后一日
     now_hm:   当前 "HH:MM"，用于判断今日是否已收盘；默认 "23:59"（视为已收盘）
-    返回 {日期: dict(close, prev, mark, grams_open, buy_g, buy_cost, pl,
-                    is_today, est)}，按日期升序。
+    返回 {日期: dict(close, prev, mark, grams_open, buy_g, buy_cost,
+                    sell_g, sell_cost, sell_px, pl, is_today, est)}，按日期升序。
 
     口径（支付宝式，已用 10-26 盘中两时点证实）：
       当日盈亏 = 当日结算持仓克数 × (今日日结价 − 上一交易日日结价)
-      当日结算持仓 = 开盘存量 + 当日买入克数（当日买入即计入，按上一交易日
-      日结价给新买入计当日盈亏；买入价只影响成本，不进入日盈亏公式）。
+      当日结算持仓 = 开盘存量 + 当日买入克数 − 当日卖出克数（当日买入即计入，
+      按上一交易日日结价给新买入计当日盈亏；买入价只影响成本，不进入日盈亏公式）。
+      当日卖出部分按“成交价 − 上一交易日日结价”计入当日已实现盈亏，并扣除赎回
+      手续费（赎回金额×0.5%），不重复计量。
     日结价优先取 settles（工行22:20截止自报价，与支付宝同源）；程序未运行而
     漏记的日期，用黄金9999日K收盘价近似并标记为估算。
     """
@@ -854,8 +857,8 @@ def daily_pl_rows(settles, est_daily, trades, total_grams,
     else:
         dates2 = dates
 
-    # 买入按交易日归集；非交易日（周末/节假日）成交的，顺延计入之后首个有行情日
-    buy_g, buy_a = {}, {}
+    # 买卖按交易日归集；非交易日（周末/节假日）成交的，顺延计入之后首个有行情日
+    buy_g, buy_a, sell_g, sell_a = {}, {}, {}, {}
     for t in trades:
         g = float(t.get("grams") or 0)
         a = float(t.get("amount") or 0)
@@ -863,10 +866,14 @@ def daily_pl_rows(settles, est_daily, trades, total_grams,
             continue
         ds = str(t.get("dt", ""))[:10]
         settle = next((d for d in dates2 if d >= ds), dates2[-1])
-        buy_g[settle] = buy_g.get(settle, 0.0) + g
-        buy_a[settle] = buy_a.get(settle, 0.0) + a
+        if str(t.get("side") or "buy").lower() == "sell":
+            sell_g[settle] = sell_g.get(settle, 0.0) + g
+            sell_a[settle] = sell_a.get(settle, 0.0) + a
+        else:
+            buy_g[settle] = buy_g.get(settle, 0.0) + g
+            buy_a[settle] = buy_a.get(settle, 0.0) + a
 
-    detail_g = sum(buy_g.values())
+    detail_g = sum(buy_g.values()) - sum(sell_g.values())
     base_g = max(float(total_grams or 0) - detail_g, 0.0)
     today = today or dates2[-1]
     now_hm = now_hm or "23:59"
@@ -877,28 +884,37 @@ def daily_pl_rows(settles, est_daily, trades, total_grams,
     for d in dates2:
         cur_c = close.get(d)
         is_today = bool(live_sell) and d == today and now_hm <= "22:20"
-        if cur_c is None and not is_today:
-            # 既无日结价又非盘中实时（如早期缺口/非交易日）：不产出，但买入仍计入存量
-            grams_open += buy_g.get(d, 0.0)
-            continue
         g_t, a_t = buy_g.get(d, 0.0), buy_a.get(d, 0.0)
+        s_g, s_a = sell_g.get(d, 0.0), sell_a.get(d, 0.0)
+        if cur_c is None and not is_today:
+            # 既无日结价又非盘中实时（如早期缺口/非交易日）：不产出，但买卖仍计入存量
+            grams_open += g_t - s_g
+            continue
         if prev_c is None:
             # 首个有效日之前没有日结基准，日价差盈亏无意义（今日盘中同理，需昨夜价）
-            grams_open += g_t
+            grams_open += g_t - s_g
             if cur_c is not None:
                 prev_d, prev_c = d, cur_c
             continue
         mark = float(live_sell) if is_today else cur_c
-        # 支付宝口径：当日买入即计入结算持仓，统一按上一交易日日结价起算
-        pl = (grams_open + g_t) * (mark - prev_c)
+        # 支付宝口径：当日买入即计入结算持仓，统一按上一交易日日结价起算；
+        # 当日卖出部分改为按实际成交价与上一交易日日结价之差，计入已实现盈亏
+        held = grams_open + g_t - s_g
+        sell_px = (s_a / s_g) if s_g > 0 else 0.0
+        # 赎回（卖出）按赎回金额收 0.5% 手续费，已实现盈亏按扣费后口径
+        sell_fee = s_g * sell_px * REDEEM_FEE_RATE if s_g > 0 else 0.0
+        sell_pl = (s_g * (sell_px - prev_c) - sell_fee) if s_g > 0 else 0.0
+        pl = held * (mark - prev_c) + sell_pl
         rows[d] = {
             "close": cur_c if cur_c is not None else mark, "prev": prev_c,
             "prev_day": prev_d, "mark": mark,
             "grams_open": grams_open, "buy_g": g_t, "buy_cost": a_t,
+            "sell_g": s_g, "sell_cost": s_a, "sell_px": sell_px,
+            "sell_fee": sell_fee,
             "pl": pl, "is_today": is_today,
             "est": bool(est_flag.get(d) or est_flag.get(prev_d)),
         }
-        grams_open += g_t
+        grams_open += g_t - s_g
         if cur_c is not None:
             prev_d, prev_c = d, cur_c
     return rows
@@ -1101,7 +1117,7 @@ class _ChartLabels:
         return x2 - x1, y2 - y1
 
     def add(self, mx, my, text, kind="buy"):
-        """kind: buy=买点（橙） / gold=高低点（金）"""
+        """kind: buy=买点（橙） / sell=卖点（绿） / gold=高低点（金）"""
         font = ("Microsoft YaHei UI", 8)
         tw, th = self._measure(text, font)
         w, h = tw + self.PAD_X * 2, th + self.PAD_Y * 2
@@ -1139,7 +1155,12 @@ class _ChartLabels:
         self._draw_leaders()
         # 锚点圆点画在引线之上、胶囊之下：落在标签带内的点会被不透明胶囊自然遮住
         for it in self.items:
-            r, color = (4.5, "#ff9e4d") if it["kind"] == "buy" else (3.6, C_GOLD)
+            if it["kind"] == "buy":
+                r, color = 4.5, "#ff9e4d"
+            elif it["kind"] == "sell":
+                r, color = 4.5, C_DOWN
+            else:
+                r, color = 3.6, C_GOLD
             mx, my = it["mx"], it["my"]
             self.cv.create_oval(mx - r, my - r, mx + r, my + r,
                                 fill=color, outline=C_CHART, width=1.6)
@@ -1147,6 +1168,8 @@ class _ChartLabels:
             x1, y1, x2, y2 = it["box"]
             if it["kind"] == "buy":
                 fill, outline, tcolor = C_CHART, "#a85f22", "#ffb36b"
+            elif it["kind"] == "sell":
+                fill, outline, tcolor = C_CHART, "#1f6f52", C_DOWN
             else:
                 fill, outline, tcolor = C_AREA, C_GOLD_DIM, C_GOLD_HI
             self.cv.create_rectangle(x1, y1, x2, y2, fill=fill, outline=outline)
@@ -1239,7 +1262,7 @@ class _ChartLabels:
           绝不穿过同列胶囊；锚点被列胶囊遮住时不回连，其余从列外一侧水平挂到总线；
         - 单点标签：锚点在标签水平跨度内走竖直短线，在外侧走直角两段。
         预留区（成本胶囊/价签）均在列的另一侧，总线与回连线不会穿过它们。"""
-        color = {"buy": "#ffb36b", "gold": "#d8bd7e"}
+        color = {"buy": "#ffb36b", "sell": C_DOWN, "gold": "#d8bd7e"}
         col_items, singles = [], []
         for it in self.items:
             (col_items if it.get("col") else singles).append(it)
@@ -1267,9 +1290,9 @@ class _ChartLabels:
                 cx2 = max(it["box"][2] for it in grp)
                 bus_x = cx2 + 7
             ys = sorted((b[1] + b[3]) / 2 for b in (it["box"] for it in grp))
-            # 竖直总线：贯通最上与最下标签中心
+            # 竖直总线：贯通最上与最下标签中心（取该列首个标签的颜色）
             self.cv.create_line(bus_x, ys[0], bus_x, ys[-1],
-                                fill=color["buy"], width=1)
+                                fill=color.get(grp[0]["kind"], "#ffb36b"), width=1)
             col_x1 = min(i["box"][0] for i in grp)
             col_x2 = max(i["box"][2] for i in grp)
             col_y1 = min(i["box"][1] for i in grp)
@@ -2143,8 +2166,8 @@ class GoldMonitorApp:
                          add="+")
 
         add_row(0, "持有克数(克)", grams_var)
-        add_row(2, "累计投入成本(元)", cost_var,
-                "今日/每日盈亏按日K收盘+交易记录自动重算，无需填基准价")
+        add_row(2, "持仓成本(元)", cost_var,
+                "当前持仓对应的成本；减仓会按均价自动结转")
 
         def on_save():
             try:
@@ -2368,28 +2391,29 @@ class GoldMonitorApp:
             self._trades_win.focus_force()
             return
         win = tk.Toplevel(self.root)
-        win.title("我的战绩 · 逐笔补仓盈亏")
+        win.title("我的战绩 · 逐笔买卖盈亏")
         win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
-        win.geometry("600x540")
-        win.minsize(560, 460)
+        win.geometry("620x540")
+        win.minsize(580, 460)
         win.configure(bg=C_BG)
         win.transient(self.root)
 
-        tk.Label(win, text="我的战绩 · 按实时赎回价计算浮动盈亏", bg=C_BG, fg=C_GOLD_HI,
+        tk.Label(win, text="我的战绩 · 补仓浮动盈亏 / 减仓已实现盈亏", bg=C_BG, fg=C_GOLD_HI,
                 font=(FONT, 11, "bold")).pack(anchor="w", padx=16, pady=(12, 2))
         self._trades_tip_var = tk.StringVar(value="")
         tk.Label(win, textvariable=self._trades_tip_var, bg=C_BG, fg=C_TXT_2,
                 font=(FONT, 8), justify="left").pack(anchor="w", padx=16)
 
-        cols = ("dt", "amount", "grams", "price", "pl", "pct")
-        headers = ("买入时间", "金额(元)", "克数(克)", "买入价", "浮动盈亏(元)", "涨跌幅")
-        widths = (130, 80, 85, 75, 105, 75)
+        cols = ("dt", "side", "amount", "grams", "price", "pl", "pct")
+        headers = ("交易时间", "类型", "金额(元)", "克数(克)", "成交价", "盈亏(元)", "收益率")
+        widths = (112, 46, 76, 78, 66, 92, 70)
         frame = tk.Frame(win, bg=C_CARD, highlightbackground=C_LINE, highlightthickness=1)
         frame.pack(fill="both", expand=True, padx=16, pady=10)
         tree = ttk.Treeview(frame, columns=cols, show="headings", height=11, selectmode="browse")
         for c, h, w in zip(cols, headers, widths):
             tree.heading(c, text=h)
-            tree.column(c, width=w, anchor="w" if c == "dt" else "e")
+            tree.column(c, width=w,
+                        anchor="w" if c == "dt" else ("center" if c == "side" else "e"))
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
         tree.pack(side="left", fill="both", expand=True)
@@ -2404,6 +2428,8 @@ class GoldMonitorApp:
         btns.pack(fill="x", padx=16, pady=(0, 12))
         ttk.Button(btns, text="记一笔补仓", style="Gold.TButton",
                    command=self._add_trade).pack(side="left")
+        ttk.Button(btns, text="记一笔减仓",
+                   command=lambda: self._add_trade("sell")).pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="补仓计划价",
                    command=self._open_plans).pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="删除选中", command=self._delete_trade).pack(side="left", padx=8)
@@ -2424,80 +2450,112 @@ class GoldMonitorApp:
         trades = self.cfg.get("trades") or []
 
         hidden = bool(self.cfg.get("privacy"))
-        detail_g = detail_a = detail_pl = 0.0
+        buy_g_sum = buy_a_sum = sell_g_sum = sell_cost_sum = 0.0
+        realized = 0.0   # 减仓已实现盈亏合计（扣费后）
+        fee_sum = 0.0    # 减仓赎回手续费合计（赎回金额×0.5%）
         for i, t in enumerate(trades):
             amt = float(t.get("amount") or 0)
             g = float(t.get("grams") or 0)
             px = amt / g if g else 0.0
-            detail_g += g
-            detail_a += amt
+            is_sell = str(t.get("side") or "buy").lower() == "sell"
+            side_txt = "减仓" if is_sell else "补仓"
+            if is_sell:
+                sell_g_sum += g
+                sell_cost_sum += float(t.get("cost") or 0) * g
+            else:
+                buy_g_sum += g
+                buy_a_sum += amt
+            dt = t.get("dt", "")
             if hidden:
-                vals = (t.get("dt", ""), "****", "****", "****", "****", "****")
+                vals = (dt, "****", "****", "****", "****", "****", "****")
                 tag = ()
+            elif is_sell:
+                # 减仓：按卖出价与当时持仓均价之差计毛利，再扣赎回费（赎回金额×0.5%）
+                cpx = float(t.get("cost") or 0)
+                if cpx > 0 and g > 0:
+                    fee = amt * REDEEM_FEE_RATE
+                    pl = (px - cpx) * g - fee
+                    realized += pl
+                    fee_sum += fee
+                    pct = pl / (cpx * g) * 100  # 扣费后实际收益率（相对该笔占用成本）
+                    vals = (dt, side_txt, f"{amt:,.0f}", f"{g:.4f}", f"{px:.2f}",
+                            f"{pl:+,.2f}", f"{pct:+.2f}%")
+                    tag = ("plus",) if pl >= 0 else ("minus",)
+                else:
+                    vals = (dt, side_txt, f"{amt:,.0f}", f"{g:.4f}", f"{px:.2f}", "--", "")
+                    tag = ()
             elif sell:
                 pl = (sell - px) * g
-                detail_pl += pl
-                vals = (t.get("dt", ""), f"{amt:,.0f}", f"{g:.4f}", f"{px:.2f}",
+                vals = (dt, side_txt, f"{amt:,.0f}", f"{g:.4f}", f"{px:.2f}",
                         f"{pl:+,.2f}", f"{(sell / px - 1) * 100:+.2f}%")
                 tag = ("plus",) if pl >= 0 else ("minus",)
             else:
-                vals = (t.get("dt", ""), f"{amt:,.0f}", f"{g:.4f}", f"{px:.2f}", "--", "--")
+                vals = (dt, side_txt, f"{amt:,.0f}", f"{g:.4f}", f"{px:.2f}", "--", "--")
                 tag = ()
             tree.insert("", "end", iid=f"t{i}", values=vals, tags=tag)
 
-        # 底仓：总持仓减去补仓明细，倒挤出更早的买入
+        # 底仓：当前总持仓 − 净买入（买入−卖出），倒挤出早于所有记录交易的存量；
+        # 容差用于吸收成本/克数四舍五入带来的分位误差，避免误报“异常”
         grams0 = float(self.cfg.get("hold_grams") or 0)
         cost0 = float(self.cfg.get("hold_cost") or 0)
-        base_g, base_a = grams0 - detail_g, cost0 - detail_a
-        total_g, total_a, total_pl = detail_g, detail_a, detail_pl
-        if abs(base_g) > 0.0001 or abs(base_a) > 0.01:
-            if base_g < -0.0001 or base_a < -0.01:
+        base_g = grams0 - (buy_g_sum - sell_g_sum)
+        base_a = cost0 - (buy_a_sum - sell_cost_sum)
+        if abs(base_g) > 0.0005 or abs(base_a) > 0.5:
+            if base_g < -0.0005 or base_a < -0.5:
                 tree.insert("", "end", iid="base",
-                            values=("底仓（异常：明细超出总持仓）",
+                            values=("底仓（异常：明细超出总持仓）", "",
                                     "****" if hidden else f"{base_a:,.0f}",
-                                    "****" if hidden else f"{base_g:.4f}",
+                                    "****" if hidden else f"{base_g or 0.0:.4f}",
                                     "--", "请核对持仓" if not hidden else "****", ""),
                             tags=("minus", "base"))
             else:
                 bpx = base_a / base_g if base_g > 0.0001 else 0.0
                 if hidden:
-                    vals = ("底仓（更早买入 · 倒挤）", "****", "****", "****", "****", "****")
+                    vals = ("底仓（更早买入 · 倒挤）", "底仓", "****", "****", "****",
+                            "****", "****")
                     tags = ("base",)
                 elif sell:
                     bpl = (sell - bpx) * base_g
-                    total_pl += bpl
-                    vals = ("底仓（更早买入 · 倒挤）", f"{base_a:,.0f}", f"{base_g:.4f}",
-                            f"{bpx:.2f}", f"{bpl:+,.2f}", f"{(sell / bpx - 1) * 100:+.2f}%")
+                    vals = ("底仓（更早买入 · 倒挤）", "底仓", f"{base_a:,.0f}",
+                            f"{base_g:.4f}", f"{bpx:.2f}",
+                            f"{bpl:+,.2f}", f"{(sell / bpx - 1) * 100:+.2f}%")
                     tags = ("plus", "base") if bpl >= 0 else ("minus", "base")
                 else:
-                    vals = ("底仓（更早买入 · 倒挤）", f"{base_a:,.0f}", f"{base_g:.4f}",
-                            f"{bpx:.2f}", "--", "--")
+                    vals = ("底仓（更早买入 · 倒挤）", "底仓", f"{base_a:,.0f}",
+                            f"{base_g:.4f}", f"{bpx:.2f}", "--", "--")
                     tags = ("base",)
                 tree.insert("", "end", iid="base", values=vals, tags=tags)
-                total_g += base_g
-                total_a += base_a
 
-        # 合计
+        # 合计：当前持仓口径（克数/成本/均价），浮动盈亏按实时赎回价
         if hidden:
-            vals = ("合计", "****", "****", "****", "****", "****")
+            vals = ("合计", "****", "****", "****", "****", "****", "****")
             tags = ("total",)
-        elif sell:
-            vals = ("合计", f"{total_a:,.0f}", f"{total_g:.4f}",
-                    f"{total_a / total_g:.2f}" if total_g else "--",
-                    f"{total_pl:+,.2f}", f"{total_pl / total_a * 100:+.2f}%")
-            tags = ("plus", "total") if total_pl >= 0 else ("minus", "total")
+        elif grams0 > 0:
+            px0 = cost0 / grams0
+            if sell:
+                pl0 = (sell - px0) * grams0
+                vals = ("合计", "持仓", f"{cost0:,.0f}", f"{grams0:.4f}", f"{px0:.2f}",
+                        f"{pl0:+,.2f}", f"{(sell / px0 - 1) * 100:+.2f}%")
+                tags = ("plus", "total") if pl0 >= 0 else ("minus", "total")
+            else:
+                vals = ("合计", "持仓", f"{cost0:,.0f}", f"{grams0:.4f}",
+                        f"{px0:.2f}", "--", "--")
+                tags = ("total",)
         else:
-            vals = ("合计", f"{total_a:,.0f}", f"{total_g:.4f}",
-                    f"{total_a / total_g:.2f}" if total_g else "--", "--", "")
+            vals = ("合计", "持仓", "0", "0.0000", "--", "--", "--")
             tags = ("total",)
         tree.insert("", "end", iid="total", values=vals, tags=tags)
 
+        base_tip = "｜底仓=总持仓−净买入倒挤" if (abs(base_g) > 0.0001 or abs(base_a) > 0.01) else ""
+        fee_tip = (f"｜累计手续费 −{fee_sum:,.2f} 元｜已实现盈亏（实际到手）{realized:+,.2f} 元"
+                   if sell_g_sum else "")
         if sell:
-            self._trades_tip_var.set(
-                f"实时赎回价 {sell:.2f} 元/克｜红盈绿亏｜买入价按“金额÷克数”倒算，与App成交单价或有小幅差异")
+            tip = (f"实时赎回价 {sell:.2f} 元/克｜红盈绿亏｜补仓按现价算浮动，"
+                   f"减仓盈亏已扣赎回费（0.5%）{base_tip}{fee_tip}")
         else:
-            self._trades_tip_var.set(
-                "暂无实时赎回价（非交易时段），浮盈显示 --｜买入价按“金额÷克数”倒算")
+            tip = (f"暂无实时赎回价（非交易时段），浮盈显示 --｜补仓按现价算浮动，"
+                   f"减仓盈亏已扣赎回费（0.5%）{base_tip}{fee_tip}")
+        self._trades_tip_var.set(tip)
 
         # 重建后恢复此前选中（仅当该行仍存在），避免轮询刷新导致“删除选中”失效
         for sid in prev_sel:
@@ -2579,8 +2637,9 @@ class GoldMonitorApp:
                           "报价结算（程序 22:20 在线即自动锁定；该价为银行以 Au(T+D)/"
                           "境外价为参考的自报价，无公开接口；程序未运行而漏记的日期"
                           "用黄金9999日K近似并标“估”）；当日盘中按实时赎回价。"
-                          "每日盈亏=(昨日存量+当日买入)×(今收−昨收)，当日买入即计入、"
-                          "统一按上一交易日日结价起算；买入价只影响成本，不参与当日盈亏。",
+                          "每日盈亏=(昨日存量+当日买入−当日卖出)×(今收−昨收)+"
+                          "当日卖出克数×(卖价−昨收)，当日买入即计入、统一按上一交易日"
+                          "日结价起算；买入价只影响成本，不参与当日盈亏。",
                 bg=C_BG, fg=C_TXT_3, font=(FONT, 7),
                 justify="left", wraplength=390).pack(anchor="w", padx=16, pady=(0, 10))
 
@@ -2730,15 +2789,22 @@ class GoldMonitorApp:
         else:
             tag = "（收盘·22:20 工行结算价）"
         chg = info["mark"] - info["prev"]
-        hold_pl = info["grams_open"] * chg
-        # 支付宝口径：当日买入即计入结算持仓，与存量统一按上一交易日日结价起算
+        sell_g = float(info.get("sell_g") or 0)
+        held = info["grams_open"] + info["buy_g"] - sell_g
+        hold_pl = held * chg
+        # 支付宝口径：当日买入计入结算持仓，与存量统一按上一交易日日结价起算；
+        # 当日卖出部分按成交价与上一交易日日结价之差计已实现盈亏，并扣 0.5% 赎回费
         buy_pl = info["buy_g"] * chg
+        sell_fee = float(info.get("sell_fee") or 0)
+        sell_pl = (sell_g * (info["sell_px"] - info["prev"]) - sell_fee) if sell_g > 0 else 0.0
         if hidden:
             self._pl_detail_var.set(
                 f"{ds} 周{weekday}{tag}\n"
                 f"昨收 {info['prev']:.2f} → 今值 {info['mark']:.2f}（{chg:+.2f}）｜"
                 f"存量 {info['grams_open']:.4f} 克\n"
-                f"存量盈亏 ****｜当日买入盈亏 ****｜合计盈亏 ****")
+                f"存量盈亏 ****｜当日买入盈亏 ****"
+                + ("｜当日卖出盈亏（扣费后）****" if sell_g > 0 else "")
+                + "｜合计盈亏 ****")
             return
         lines = [
             f"{ds} 周{weekday}{tag}",
@@ -2751,6 +2817,12 @@ class GoldMonitorApp:
             lines.append(
                 f"当日买入 {info['buy_g']:.4f} 克 @ {px:.2f}（{info['buy_cost']:,.0f} 元）"
                 f"｜买入计入盈亏 {buy_pl:+,.2f} 元（按上一交易日日结价起算）")
+        if sell_g > 0:
+            lines.append(
+                f"当日卖出 {sell_g:.4f} 克 @ {info['sell_px']:.2f}"
+                f"（{info['sell_cost']:,.0f} 元）｜赎回手续费 −{sell_fee:,.2f} 元（0.5%）")
+            lines.append(
+                f"卖出已实现盈亏（扣费后）{sell_pl:+,.2f} 元（按上一交易日日结价起算）")
         sgn = "+" if info["pl"] >= 0 else ""
         lines.append(f"当日合计盈亏 {sgn}{info['pl']:,.2f} 元")
         if info.get("est"):
@@ -3030,10 +3102,21 @@ class GoldMonitorApp:
         cost = float(self.cfg.get("hold_cost") or 0)
         if grams > 0 and cost > 0:
             return cost / grams
-        ta = tg = 0.0
-        for t in self.cfg.get("trades") or []:
-            ta += float(t.get("amount") or 0)
-            tg += float(t.get("grams") or 0)
+        # 未同步总持仓时：按买卖流水回放推算（减仓按当时均价结转成本）
+        tg = ta = 0.0
+        for t in sorted(self.cfg.get("trades") or [], key=lambda x: x.get("dt", "")):
+            g = float(t.get("grams") or 0)
+            a = float(t.get("amount") or 0)
+            if g <= 0:
+                continue
+            if str(t.get("side") or "buy").lower() == "sell":
+                if tg > 0:
+                    avg = ta / tg
+                    tg = max(0.0, tg - g)
+                    ta = max(0.0, ta - avg * g)
+            else:
+                tg += g
+                ta += a
         return ta / tg if tg > 0 else None
 
     def _avg_cost_line(self, cv, L, R, y_of, avg):
@@ -3227,7 +3310,10 @@ class GoldMonitorApp:
                 thm = str(t.get("dt", ""))[11:16]
                 before = [i for i in range(n) if pts[i][0] <= thm]
                 mi = before[-1] if before else 0
-                labels.add(x_of(mi), y_of(pts[mi][1]), f"买 {px:.2f} {thm}")
+                is_sell = str(t.get("side") or "buy").lower() == "sell"
+                labels.add(x_of(mi), y_of(pts[mi][1]),
+                           f"{'卖' if is_sell else '买'} {px:.2f} {thm}",
+                           kind="sell" if is_sell else "buy")
         labels.flush()
 
         # 最新价价签
@@ -3237,10 +3323,10 @@ class GoldMonitorApp:
         if hidden:
             self._chart_tip_base = (
                 "在线分时：东方财富黄金9999（与积存金同源，点差通常 0~1 元/克）；"
-                "隐私模式下买入点位与成本线已隐藏。")
+                "隐私模式下买卖点位与成本线已隐藏。")
         else:
             self._chart_tip_base = (
-                "金色曲线=东方财富黄金9999在线分时（无需程序常开）｜橙点=当日买入成交价"
+                "金色曲线=东方财富黄金9999在线分时（无需程序常开）｜橙点=买入、绿点=卖出成交价"
                 "｜橙色虚线=持仓成本｜蓝色虚线=补仓计划价（鼠标移动可看任意时点价格）")
         self._chart_pts = [(x_of(i), y_of(p), f"{date} {hm}", p)
                            for i, (hm, p) in enumerate(pts)]
@@ -3360,8 +3446,10 @@ class GoldMonitorApp:
                 rank = len(day_rank.setdefault(ds, []))
                 day_rank[ds].append(t)
                 jitter = (rank - (day_count.get(ds, 1) - 1) / 2) * 8
+                is_sell = str(t.get("side") or "buy").lower() == "sell"
                 labels.add(x_of(di) + jitter, y_of(closes[di]),
-                           f"买 {px:.2f}  {dshort}")
+                           f"{'卖' if is_sell else '买'} {px:.2f}  {dshort}",
+                           kind="sell" if is_sell else "buy")
         labels.flush()
 
         # 最新价价签（较前一交易日涨跌着色）
@@ -3373,11 +3461,11 @@ class GoldMonitorApp:
 
         if hidden:
             self._chart_tip_base = (
-                "历史日K：东方财富黄金9999收盘价（2020年至今可查）；隐私模式下买入点位已隐藏。")
+                "历史日K：东方财富黄金9999收盘价（2020年至今可查）；隐私模式下买卖点位已隐藏。")
         else:
             self._chart_tip_base = (
-                "金色曲线=东方财富黄金9999日收盘价｜橙点=每笔买入成交价（定位到成交当日，节假日顺延），"
-                "标签自动避让、引线连到买点｜橙色虚线=持仓成本｜蓝色虚线=补仓计划价"
+                "金色曲线=东方财富黄金9999日收盘价｜橙点=买入、绿点=卖出成交价（定位到成交当日，"
+                "节假日顺延），标签自动避让、引线连到成交点｜橙色虚线=持仓成本｜蓝色虚线=补仓计划价"
                 "（鼠标移动可看任意时点收盘价）")
         self._chart_pts = [(x_of(i), y_of(r[2]), r[0], r[2])
                            for i, r in enumerate(kl)]
@@ -3509,7 +3597,10 @@ class GoldMonitorApp:
                 near = [p for hm, p in pts if hm <= thm]
                 mp = near[-1] if near else px
                 mp = min(max(mp, y_min), y_max)
-                labels.add(x_of(thm), y_of(mp), f"买 {px:.2f} {thm}")
+                is_sell = str(t.get("side") or "buy").lower() == "sell"
+                labels.add(x_of(thm), y_of(mp),
+                           f"{'卖' if is_sell else '买'} {px:.2f} {thm}",
+                           kind="sell" if is_sell else "buy")
         labels.flush()
 
         # 最新价圆点与右侧价签
@@ -3525,31 +3616,38 @@ class GoldMonitorApp:
 
         if hidden:
             self._chart_tip_base = (
-                "金色曲线为本地采集的实时赎回价（公开行情）；隐私模式下买入点位与成本线已隐藏。")
+                "金色曲线为本地采集的实时赎回价（公开行情）；隐私模式下买卖点位与成本线已隐藏。")
         else:
             self._chart_tip_base = (
                 "金色曲线=本地按分钟采集的赎回价（仅程序运行期间有数据，建议用在线模式）"
-                "｜橙点=当日买入成交价，标签自动避让｜橙色虚线=持仓成本"
+                "｜橙点=买入、绿点=卖出成交价，标签自动避让｜橙色虚线=持仓成本"
                 "｜蓝色虚线=补仓计划价（鼠标移动可看任意时点价格）")
         self._chart_pts = [(x_of(hm), y_of(p), f"{selected} {hm}", p)
                            for hm, p in pts]
         self._chart_tip_var.set(self._chart_tip_base)
 
-    def _add_trade(self):
+    def _add_trade(self, side="buy"):
+        is_sell = str(side).lower() == "sell"
         win = tk.Toplevel(self.root)
-        win.title("记一笔补仓")
+        win.title("记一笔减仓" if is_sell else "记一笔补仓")
         win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
-        win.geometry("310x300")
+        win.geometry("360x330" if is_sell else "310x300")
         win.resizable(False, False)
         win.configure(bg=C_BG)
         win.transient(self._trades_win or self.root)
         win.grab_set()
 
         dt_var = tk.StringVar(value=f"{datetime.now():%Y-%m-%d %H:%M}")
-        amt_var = tk.StringVar(value="5000")
+        amt_var = tk.StringVar(value="" if is_sell else "5000")
         grams_var = tk.StringVar(value="")
+        price_var = tk.StringVar(value="")
+        amt_hint = tk.StringVar(value="")
         sync_var = tk.BooleanVar(value=True)
-        buy_px = self._latest_data.get("jicun_active")
+        hold_g = float(self.cfg.get("hold_grams") or 0)
+        hold_cost = float(self.cfg.get("hold_cost") or 0)
+        # 卖出按赎回价成交，买入按主动买入价成交
+        px = (self._latest_data.get("jicun_sell") if is_sell
+              else self._latest_data.get("jicun_active"))
 
         def form_row(r, label, var, hint=None):
             tk.Label(win, text=label, bg=C_BG, fg=C_TXT_2,
@@ -3562,27 +3660,89 @@ class GoldMonitorApp:
                          font=(FONT, 8)).grid(
                     row=r + 1, column=1, sticky="w", padx=8)
 
-        form_row(0, "买入时间", dt_var)
-        form_row(2, "金额(元)", amt_var)
-        form_row(4, "克数(克)", grams_var,
-                 "留空则按实时买入价倒算" + (f"（当前 {buy_px:g}）" if buy_px else "，暂无报价需手填"))
-        dark_checkbutton(win, "同时计入总持仓克数与成本", sync_var).grid(
-            row=6, column=0, columnspan=2, sticky="w", padx=14, pady=(10, 0))
+        form_row(0, "卖出时间" if is_sell else "买入时间", dt_var)
+        if is_sell:
+            price_var.set(f"{px:g}" if px else "")
+            form_row(2, "卖出克数(克)", grams_var, f"当前持仓 {hold_g:g} 克")
+            form_row(4, "成交价(元/克)", price_var,
+                     "默认实时赎回价，可按实际成交价修改")
+
+            def _upd_amt(*_):
+                try:
+                    g_ = float(grams_var.get().strip() or 0)
+                    p_ = float(price_var.get().strip() or 0)
+                except ValueError:
+                    amt_hint.set("成交金额：--")
+                    return
+                amt_hint.set(f"成交金额 = {g_:g} × {p_:g} = {g_ * p_:,.2f} 元"
+                             if g_ > 0 and p_ > 0 else "成交金额：--")
+            grams_var.trace_add("write", _upd_amt)
+            price_var.trace_add("write", _upd_amt)
+            _upd_amt()
+            tk.Label(win, textvariable=amt_hint, bg=C_BG, fg=C_GOLD,
+                     font=(FONT, 9, "bold")).grid(
+                row=6, columnspan=2, sticky="w", padx=16, pady=(10, 0))
+        else:
+            form_row(2, "金额(元)", amt_var)
+            form_row(4, "克数(克)", grams_var,
+                     "留空则按实时买入价倒算" + (f"（当前 {px:g}）" if px else "，暂无报价需手填"))
+        dark_checkbutton(win, "同时从总持仓扣减克数与成本" if is_sell
+                         else "同时计入总持仓克数与成本", sync_var).grid(
+            row=7 if is_sell else 6, column=0, columnspan=2, sticky="w",
+            padx=14, pady=(10, 0))
 
         def on_save():
+            g_raw = grams_var.get().strip()
             try:
-                amt = float(amt_var.get())
-                g = float(grams_var.get()) if grams_var.get().strip() else 0.0
+                g = float(g_raw) if g_raw else 0.0
+            except ValueError:
+                g = -1.0
+
+            if is_sell:
+                # 减仓：克数 × 成交价 → 金额，只有这两个输入，避免“金额/单价”串位
+                try:
+                    p = float(price_var.get().strip() or 0)
+                except ValueError:
+                    p = -1.0
+                if g <= 0 or p <= 0:
+                    messagebox.showwarning(
+                        "添加减仓", "请填写卖出克数与成交价（元/克）。", parent=win)
+                    return
+                if sync_var.get() and g > hold_g + 1e-6:
+                    messagebox.showwarning(
+                        "添加减仓",
+                        f"卖出 {g:g} 克超过当前持仓 {hold_g:g} 克，请核对。", parent=win)
+                    return
+                amt = g * p
+                # 平均成本法：卖出按当前持仓均价结转成本，剩余持仓均价不变
+                avg_cost = hold_cost / hold_g if hold_g > 0 else p
+                rec = {"dt": dt_var.get().strip() or f"{datetime.now():%Y-%m-%d %H:%M}",
+                       "amount": round(amt, 2), "grams": round(g, 4),
+                       "side": "sell", "cost": round(avg_cost, 4)}
+                trades = self.cfg.setdefault("trades", [])
+                trades.append(rec)
+                trades.sort(key=lambda x: x.get("dt", ""), reverse=True)
+                if sync_var.get():
+                    self.cfg["hold_grams"] = max(0.0, hold_g - g)
+                    self.cfg["hold_cost"] = max(0.0, hold_cost - avg_cost * g)
+                self._after_trade()
+                win.destroy()
+                return
+
+            # 补仓：金额必填，克数留空按实时买入价倒算（与原有逻辑一致）
+            try:
+                amt = float(amt_var.get().strip() or 0)
                 if amt <= 0 or g < 0:
                     raise ValueError
             except ValueError:
                 messagebox.showwarning("添加补仓", "请填写有效的金额/克数。", parent=win)
                 return
             if g <= 0:
-                if not buy_px:
-                    messagebox.showwarning("添加补仓", "暂无实时买入价，请手动填写克数。", parent=win)
+                if not px:
+                    messagebox.showwarning(
+                        "添加补仓", "暂无实时买入价，请手动填写克数。", parent=win)
                     return
-                g = amt / buy_px
+                g = amt / px
             rec = {"dt": dt_var.get().strip() or f"{datetime.now():%Y-%m-%d %H:%M}",
                    "amount": round(amt, 2), "grams": round(g, 4)}
             trades = self.cfg.setdefault("trades", [])
@@ -3591,20 +3751,28 @@ class GoldMonitorApp:
             if sync_var.get():
                 self.cfg["hold_grams"] = float(self.cfg.get("hold_grams") or 0) + g
                 self.cfg["hold_cost"] = float(self.cfg.get("hold_cost") or 0) + amt
-            self._persist()
-            self._render_position()
-            self._refresh_trades()
-            self._refresh_pl_calendar()
+            self._after_trade()
             win.destroy()
 
-        ttk.Button(win, text="含泪记上", style="Gold.TButton",
-                   command=on_save).grid(row=7, column=0, pady=16)
-        ttk.Button(win, text="取消", command=win.destroy).grid(row=7, column=1)
+        ttk.Button(win, text="落袋为安" if is_sell else "含泪记上",
+                   style="Gold.TButton", command=on_save).grid(
+            row=8 if is_sell else 7, column=0, pady=16)
+        ttk.Button(win, text="取消", command=win.destroy).grid(
+            row=8 if is_sell else 7, column=1)
+
+    def _after_trade(self):
+        """成交记录变动后的统一刷新（买卖共用）。"""
+        self._persist()
+        self._render_position()
+        self._refresh_trades()
+        self._refresh_pl_calendar()
+        if self._chart_win is not None:
+            self._draw_chart()
 
     def _delete_trade(self):
         tree = self._trades_tree
         sel = tree.selection()
-        # 严格匹配补仓行 iid（"t0"/"t1"…），排除 "total" 等以 t 开头的合计/底仓行
+        # 严格匹配成交行 iid（"t0"/"t1"…），排除 "total" 等以 t 开头的合计/底仓行
         idx = None
         if sel:
             sid = sel[0]
@@ -3612,26 +3780,32 @@ class GoldMonitorApp:
                 idx = int(sid[1:])
         trades = self.cfg.get("trades") or []
         if idx is None or not (0 <= idx < len(trades)):
-            messagebox.showinfo("删除补仓", "请先选中一笔补仓记录（合计、底仓行不可删除）。",
+            messagebox.showinfo("删除记录", "请先选中一笔成交记录（合计、底仓行不可删除）。",
                                 parent=self._trades_win)
             return
         t = trades[idx]
-        if not messagebox.askyesno(
-                "删除补仓",
-                f"删除 {t.get('dt', '')} 买入 {float(t.get('amount') or 0):,.0f} 元的记录？\n"
-                "总持仓克数与成本将同步扣减（底仓相应增加）。",
-                parent=self._trades_win):
+        is_sell = str(t.get("side") or "buy").lower() == "sell"
+        g = float(t.get("grams") or 0)
+        if is_sell:
+            tip = f"删除 {t.get('dt', '')} 卖出 {g:.4f} 克的记录？\n总持仓克数与成本将同步加回。"
+        else:
+            tip = (f"删除 {t.get('dt', '')} 买入 {float(t.get('amount') or 0):,.0f} 元的记录？\n"
+                   "总持仓克数与成本将同步扣减（底仓相应增加）。")
+        if not messagebox.askyesno("删除记录", tip, parent=self._trades_win):
             return
-        self.cfg["hold_grams"] = max(
-            0.0, float(self.cfg.get("hold_grams") or 0) - float(t.get("grams") or 0))
-        self.cfg["hold_cost"] = max(
-            0.0, float(self.cfg.get("hold_cost") or 0) - float(t.get("amount") or 0))
+        if is_sell:
+            self.cfg["hold_grams"] = float(self.cfg.get("hold_grams") or 0) + g
+            cost_px = float(t.get("cost") or 0)
+            if cost_px > 0:
+                self.cfg["hold_cost"] = float(self.cfg.get("hold_cost") or 0) + cost_px * g
+        else:
+            self.cfg["hold_grams"] = max(
+                0.0, float(self.cfg.get("hold_grams") or 0) - g)
+            self.cfg["hold_cost"] = max(
+                0.0, float(self.cfg.get("hold_cost") or 0) - float(t.get("amount") or 0))
         del trades[idx]
         self.cfg["trades"] = trades
-        self._persist()
-        self._render_position()
-        self._refresh_trades()
-        self._refresh_pl_calendar()
+        self._after_trade()
 
     def _render_position(self):
         """根据最新赎回价计算并刷新持仓卡片。"""
