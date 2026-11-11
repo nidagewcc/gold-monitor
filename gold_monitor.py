@@ -15,6 +15,7 @@ import math
 import os
 import ssl
 import sys
+import ctypes
 import threading
 import time
 import traceback
@@ -139,84 +140,86 @@ REDEEM_FEE_RATE = 0.005
 # 每个主题给出同一套语义色键；模块级 C_* 是当前主题的全局别名，
 # 切主题时 apply_theme() 统一刷新，业务代码全部引用 C_* 即可。
 THEMES = {
-    # 轻奢米金·夜：暖墨底色 + 香槟金，去掉生硬描边，靠背景深浅分层
+    # Win11 Fluent·夜：中性深灰底 + 系统蓝强调；Win11 上 C_BG 由 _apply_backdrop
+    # 挂亚克力磨砂玻璃（实测仅深色 GDI 文字清晰），老系统/浅色下即普通不透明纯色底
     "dark": {
-        "C_BG":       "#161310",   # 窗口底色（暖墨）
-        "C_CARD":     "#201c17",   # 卡片底色（略亮暖咖）
-        "C_CARD_2":   "#2a251e",   # 输入框/次级控件底色
-        "C_LINE":     "#383128",   # 分隔线（柔，弱对比）
-        "C_GOLD":     "#d4af6a",   # 主金色（香槟金）
-        "C_GOLD_HI":  "#f3ddaa",   # 高亮金（大数字/标题）
-        "C_GOLD_DIM": "#a9854a",   # 暗金（弱提示/选中底）
-        "C_TXT":      "#f2ece0",   # 主文字（暖白）
-        "C_TXT_2":    "#b3a894",   # 次要文字
-        "C_TXT_3":    "#7d7362",   # 弱化文字
-        "C_UP":       "#f26a5c",   # 涨/盈利（珊瑚红）
-        "C_DOWN":     "#34c98c",   # 跌/亏损（翡翠绿）
-        "C_CHART":    "#1b1814",   # 走势图画布底色
-        "C_UP_BG":    "#3a211d",   # 涨徽章底色
-        "C_DOWN_BG":  "#163026",   # 跌徽章底色
-        "C_ROAST_GOLD_BG": "#2c2417",
-        "C_ROAST_UP_BG":   "#36201d",
-        "C_ROAST_DN_BG":   "#152c24",
-        # 金底按钮上的压字色
-        "C_ON_GOLD":  "#221a0c",
-        "C_ON_UP":    "#221a0c",
-        # 控件悬停/按下
-        "C_HOVER":    "#322b22",
-        "C_ACTIVE":   "#3f372c",
-        "C_PRESSED":  "#382f25",
-        "C_SEL":      "#4a3c22",   # 列表选中底
+        "C_BG":       "#202020",   # 窗口背景层（Win11 深色亚克力底；不再用色键挖空）
+        "C_CARD":     "#212121",   # 卡片层（Fluent Card Fill，纯色不透明）
+        "C_CARD_2":   "#2d2d2d",   # 输入框/次级控件（Subtle Fill）
+        "C_LINE":     "#404040",   # 分隔线（中性灰）
+        "C_GOLD":     "#0078d4",   # 强调色（Windows 系统蓝，替代原香槟金）
+        "C_GOLD_HI":  "#4cc2ff",   # 高亮蓝（hover/大数字/标题）
+        "C_GOLD_DIM": "#005a9e",   # 暗蓝（pressed/选中底）
+        "C_TXT":      "#ffffff",   # 主文字
+        "C_TXT_2":    "#c7c7c7",   # 次要文字
+        "C_TXT_3":    "#8a8a8a",   # 弱化文字
+        "C_UP":       "#e23d3a",   # 涨/盈利（红，Fluent 明度）
+        "C_DOWN":     "#2e9e5b",   # 跌/亏损（绿）
+        "C_CHART":    "#1c1c1c",   # 走势图画布底色（纯色不透）
+        "C_UP_BG":    "#3a1d1b",   # 涨徽章底色
+        "C_DOWN_BG":  "#143323",   # 跌徽章底色
+        "C_ROAST_GOLD_BG": "#0f2a3f",
+        "C_ROAST_UP_BG":   "#3a1d1b",
+        "C_ROAST_DN_BG":   "#143323",
+        # 蓝底/红底按钮上的压字色
+        "C_ON_GOLD":  "#ffffff",
+        "C_ON_UP":    "#ffffff",
+        # 控件悬停/按下（中性灰阶梯度）
+        "C_HOVER":    "#323232",
+        "C_ACTIVE":   "#3d3d3d",
+        "C_PRESSED":  "#2a2a2a",
+        "C_SEL":      "#003a66",   # 列表选中底（深蓝）
         # Canvas 走势图
-        "C_GRID":     "#2a251e",
-        "C_GRID_AX":  "#332c23",
-        "C_AREA":     "#33281a",
-        "C_REF_DASH": "#5a5142",
-        "C_BASE_BG":  "#2e2618",   # 补仓基准行底色
-        "C_TOTAL_BG": "#282218",   # 合计行底色
-        "C_ICON_DISK": "#201c17",  # 应用图标盘心色
-        "C_COST":     "#f0b368",   # 持仓成本线标注（琥珀）
-        "C_COST_LINE": "#df9a4c",  # 持仓成本虚线
-        "C_PLAN":     "#8ab4ef",   # 补仓计划价标注（雾蓝）
-        "C_PLAN_LINE": "#6a97d8",  # 补仓计划虚线
+        "C_GRID":     "#2a2a2a",
+        "C_GRID_AX":  "#333333",
+        "C_AREA":     "#1f3a5f",   # 面积填充（淡蓝）
+        "C_REF_DASH": "#5a5a5a",
+        "C_BASE_BG":  "#0f2a3f",   # 补仓基准行底色
+        "C_TOTAL_BG": "#242424",   # 合计行底色
+        "C_ICON_DISK": "#212121",  # 应用图标盘心色
+        "C_COST":     "#f2a63b",   # 持仓成本线标注（琥珀，图上与蓝区分）
+        "C_COST_LINE": "#f2a63b",  # 持仓成本虚线
+        "C_PLAN":     "#4cc2ff",   # 补仓计划价标注（亮蓝）
+        "C_PLAN_LINE": "#4cc2ff",  # 补仓计划虚线
     },
-    # 轻奢米金·昼（主打）：奶白卡面 + 墨金标题 + 翡绿/朱红，大量留白
+    # Win11 Fluent·昼：纯白卡片 + 深系统蓝强调；浅色不挂亚克力（GDI 浅色玻璃会整体发白），
+    # C_BG 用浅灰纯色底与白卡片分层
     "light": {
-        "C_BG":       "#f6f1e7",   # 窗口底色（奶油象牙）
-        "C_CARD":     "#fffdf8",   # 卡片白（微暖）
-        "C_CARD_2":   "#f1ebe0",   # 输入框/次级控件（米色）
-        "C_LINE":     "#e7ddcb",   # 分隔线（柔金米）
-        "C_GOLD":     "#a87d2f",   # 主金色（古铜金，浅底下压深可读）
-        "C_GOLD_HI":  "#7c5a17",   # 大数字墨金
-        "C_GOLD_DIM": "#c7a866",   # 暗金/香槟
-        "C_TXT":      "#33291d",   # 主文字（暖墨褐）
-        "C_TXT_2":    "#7c6f5b",   # 次要文字
-        "C_TXT_3":    "#a99d88",   # 弱化文字
-        "C_UP":       "#d8483a",   # 涨/盈利（朱红）
-        "C_DOWN":     "#0f9d6d",   # 跌/亏损（翡绿）
-        "C_CHART":    "#fdfbf6",
-        "C_UP_BG":    "#fbe9e5",
-        "C_DOWN_BG":  "#e0f4eb",
-        "C_ROAST_GOLD_BG": "#faf1dd",
-        "C_ROAST_UP_BG":   "#fbe9e5",
-        "C_ROAST_DN_BG":   "#e0f4eb",
-        "C_ON_GOLD":  "#fffdf8",
-        "C_ON_UP":    "#fffdf8",
-        "C_HOVER":    "#f0e7d4",
-        "C_ACTIVE":   "#e8ddc6",
-        "C_PRESSED":  "#e0d3b8",
-        "C_SEL":      "#f2e4c4",
-        "C_GRID":     "#eee6d6",
-        "C_GRID_AX":  "#e4dac6",
-        "C_AREA":     "#f5e9cd",
-        "C_REF_DASH": "#c3b59a",
-        "C_BASE_BG":  "#f6ecd2",
-        "C_TOTAL_BG": "#f2ecdf",
-        "C_ICON_DISK": "#fffdf8",
+        "C_BG":       "#eaeaea",   # 窗口背景层（浅色纯色底，不用材质）
+        "C_CARD":     "#ffffff",   # 卡片白
+        "C_CARD_2":   "#f3f3f3",   # 输入框/次级控件（Subtle Fill）
+        "C_LINE":     "#e5e5e5",   # 分隔线
+        "C_GOLD":     "#005fb8",   # 强调色（Win11 浅色模式系统蓝）
+        "C_GOLD_HI":  "#0067c0",   # 高亮蓝
+        "C_GOLD_DIM": "#00457a",   # 暗蓝
+        "C_TXT":      "#1a1a1a",   # 主文字
+        "C_TXT_2":    "#5c5c5c",   # 次要文字
+        "C_TXT_3":    "#8a8a8a",   # 弱化文字
+        "C_UP":       "#c42b1c",   # 涨/盈利（朱红）
+        "C_DOWN":     "#0e7a3b",   # 跌/亏损（翡绿）
+        "C_CHART":    "#fbfbfb",
+        "C_UP_BG":    "#fde7e5",
+        "C_DOWN_BG":  "#e4f4ec",
+        "C_ROAST_GOLD_BG": "#ebf3ff",
+        "C_ROAST_UP_BG":   "#fde7e5",
+        "C_ROAST_DN_BG":   "#e4f4ec",
+        "C_ON_GOLD":  "#ffffff",
+        "C_ON_UP":    "#ffffff",
+        "C_HOVER":    "#f0f0f0",
+        "C_ACTIVE":   "#ebebeb",
+        "C_PRESSED":  "#e0e0e0",
+        "C_SEL":      "#ebf3ff",
+        "C_GRID":     "#ededed",
+        "C_GRID_AX":  "#e4e4e4",
+        "C_AREA":     "#e8f1fb",
+        "C_REF_DASH": "#c8c8c8",
+        "C_BASE_BG":  "#ebf3ff",
+        "C_TOTAL_BG": "#f6f6f6",
+        "C_ICON_DISK": "#ffffff",
         "C_COST":     "#b5701c",
         "C_COST_LINE": "#c2812a",
-        "C_PLAN":     "#2f6fbf",
-        "C_PLAN_LINE": "#2f6fbf",
+        "C_PLAN":     "#005fb8",
+        "C_PLAN_LINE": "#005fb8",
     },
 }
 
@@ -312,38 +315,99 @@ def _make_icon_photo(size=64):
         return None
 
 
-def _dark_title(win, dark=True):
-    """让 Windows 窗口标题栏跟随深色/浅色模式（Win10 2004+ / Win11 生效，旧版静默忽略）。"""
+# Windows 内部构建号：亚克力材质只在 Win11 22H2（22621）起挂，旧系统保持纯色
+if sys.platform.startswith("win"):
+    try:
+        _WIN_BUILD = sys.getwindowsversion().build
+    except Exception:
+        _WIN_BUILD = 0
+else:
+    _WIN_BUILD = 0
+
+_DWMWA_USE_IMMERSIVE_DARK = 20   # 标题栏明暗（Win10 2004+ / Win11）
+_WCA_ACCENT_POLICY = 19          # SetWindowCompositionAttribute 属性号
+_ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
+# 旧版亚克力着色（0xAABBGGRR）：主窗 alpha 高近似 Mica 稳重，对话框 alpha 低更通透。
+# 实测仅深色玻璃下 GDI 文字清晰；浅色玻璃会整体发白、文字发虚，故浅色不挂材质。
+_TINT_MICA_DARK = 0xCC202020
+_TINT_ACRYLIC_DARK = 0x99202020
+
+
+class _AccentPolicy(ctypes.Structure):
+    _fields_ = [("AccentState", ctypes.c_int),
+                ("AccentFlags", ctypes.c_int),
+                ("GradientColor", ctypes.c_int),
+                ("AnimationId", ctypes.c_int)]
+
+
+class _WindowCompositionAttributeData(ctypes.Structure):
+    _fields_ = [("Attribute", ctypes.c_int),
+                ("Data", ctypes.POINTER(_AccentPolicy)),
+                ("SizeOfData", ctypes.c_int)]
+
+
+def _set_acrylic(hwnd, tint):
+    """对 HWND 开关旧版亚克力（tint=None 时传 DISABLED 撤销，切回普通纯色窗口）。"""
+    import ctypes
+    user32 = ctypes.windll.user32
+    state = _ACCENT_ENABLE_ACRYLICBLURBEHIND if tint is not None else 0
+    policy = _AccentPolicy(state, 2, tint or 0, 0)
+    data = _WindowCompositionAttributeData(
+        _WCA_ACCENT_POLICY, ctypes.pointer(policy), ctypes.sizeof(policy))
+    user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
+
+
+def _apply_backdrop(win, kind="mica"):
+    """给顶层窗口挂 Win11 亚克力磨砂玻璃（深色主题）。
+    实测：tkinter 是 GDI 窗口——色键(-transparentcolor)会让一切 DWM 材质失效变全透明；
+    不透明窗口下 attr38 的 Mica/Acrylic 又被背景盖死；只有旧版 SetWindowCompositionAttribute
+    亚克力可用，且仅深色玻璃文字清晰。故策略：深色挂亚克力，浅色/旧系统/非 Win 保持纯色。
+    kind 仅区分 tint 浓度：主窗 mica 用高 alpha（近似云母稳重），对话框 acrylic 更通透。"""
     if not sys.platform.startswith("win"):
         return
+
+    def _do():
+        try:
+            if not win.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            dwm = ctypes.windll.dwmapi
+            # 不声明 restype/argtypes 时 HWND 按 int 传递，64 位句柄高位会被截断导致静默失败
+            user32.GetParent.restype = wintypes.HWND
+            user32.GetParent.argtypes = [wintypes.HWND]
+            dwm.DwmSetWindowAttribute.argtypes = [
+                wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+            hwnd = user32.GetParent(win.winfo_id()) or wintypes.HWND(win.winfo_id())
+            # 标题栏明暗跟随当前主题（深色玻璃配深标题栏，浅色配浅标题栏）
+            dark = ctypes.c_int(1 if THEME_NAME == "dark" else 0)
+            for attr in (20, 19):  # Win11/新 Win10 用 20，旧版 Win10 2004 用 19
+                dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(dark), ctypes.sizeof(dark))
+            # 仅 Win11 22H2+ 且深色主题挂亚克力；浅色显式撤销（处理从深色切到浅色）
+            tint = None
+            if _WIN_BUILD >= 22621 and THEME_NAME == "dark":
+                tint = _TINT_MICA_DARK if kind == "mica" else _TINT_ACRYLIC_DARK
+            _set_acrylic(hwnd, tint)
+            # 触发非客户区刷新，圆角/标题栏明暗立即生效（实测 Win11 26300 必须带 FRAMECHANGED）
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_FRAMECHANGED = 0x1, 0x2, 0x4, 0x20
+            user32.SetWindowPos(
+                hwnd, None, 0, 0, 0, 0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED)
+        except Exception:
+            pass
+
+    _do()
+    # 首次调用时 Toplevel 可能尚未完全映射（after 60ms 实测太早），DWM 会在映射后把标题栏
+    # 明暗重置回系统默认（亚克力私有状态不受影响）；映射稳定后幂等补设一次即可让深色标题栏保持
     try:
-        import ctypes
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        dwm = ctypes.windll.dwmapi
-        # 不声明 restype/argtypes 时 HWND 按 int 传递，64 位句柄高位会被截断导致静默失败
-        user32.GetParent.restype = wintypes.HWND
-        user32.GetParent.argtypes = [wintypes.HWND]
-        dwm.DwmSetWindowAttribute.argtypes = [
-            wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
-        hwnd = user32.GetParent(win.winfo_id()) or wintypes.HWND(win.winfo_id())
-        val = ctypes.c_int(1 if dark else 0)
-        # Win11/较新 Win10 用 20，旧版 Win10 2004 用 19，都试一遍
-        for attr in (20, 19):
-            dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val),
-                                      ctypes.sizeof(val))
-        # 仅设属性时标题栏往往不会立刻重绘（实测 Win11 26300），
-        # 必须带 FRAMECHANGED 触发一次非客户区刷新，深色标题栏才马上生效。
-        user32.SetWindowPos.argtypes = [
-            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, wintypes.UINT]
-        SWP_NOSIZE = 0x0001
-        SWP_NOMOVE = 0x0002
-        SWP_NOZORDER = 0x0004
-        SWP_FRAMECHANGED = 0x0020
-        user32.SetWindowPos(
-            hwnd, None, 0, 0, 0, 0,
-            SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED)
+        win.after(220, _do)
     except Exception:
         pass
 
@@ -1356,7 +1420,7 @@ class GoldMonitorApp:
         if self._icon is not None:
             self.root.iconphoto(True, self._icon)
         apply_dark_style(self.root)
-        self.root.after(200, lambda: _dark_title(self.root, THEME_NAME == "dark"))
+        self.root.after(200, lambda: _apply_backdrop(self.root, "mica"))
 
         self.toasts = ToastManager(self.root)
         self.stop_event = threading.Event()
@@ -1739,6 +1803,7 @@ class GoldMonitorApp:
         win.geometry("500x640")
         win.minsize(440, 480)
         win.transient(self.root)
+        win.after(60, lambda w=win: _apply_backdrop(w, "acrylic"))
 
         meta = {"job": None}       # 自动刷新 after 句柄
 
@@ -1993,7 +2058,8 @@ class GoldMonitorApp:
         self.body.destroy()
         self._build_ui()
         self._fit_window()
-        _dark_title(self.root, THEME_NAME == "dark")
+        # 主题切换后重挂：深色重新开亚克力，浅色显式撤销恢复纯色（材质状态不随色表自动变）
+        self.root.after(60, lambda: _apply_backdrop(self.root, "mica"))
         self._refresh_view_from_cache()
 
     def _refresh_view_from_cache(self):
@@ -2137,7 +2203,7 @@ class GoldMonitorApp:
     def _edit_position(self):
         win = tk.Toplevel(self.root)
         win.title("编辑我的持仓")
-        win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
+        win.after(60, lambda w=win: _apply_backdrop(w, "acrylic"))
         win.geometry("460x268")
         win.minsize(420, 240)
         win.resizable(True, True)
@@ -2190,7 +2256,7 @@ class GoldMonitorApp:
     def _avg_down_calculator(self):
         win = tk.Toplevel(self.root)
         win.title("加仓小天才 · 回本测算")
-        win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
+        win.after(60, lambda w=win: _apply_backdrop(w, "acrylic"))
         win.geometry("430x486")
         win.resizable(False, False)
         win.configure(bg=C_BG)
@@ -2291,7 +2357,7 @@ class GoldMonitorApp:
     def _sell_calculator(self):
         win = tk.Toplevel(self.root)
         win.title("跑路计算器 · 赎回手续费")
-        win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
+        win.after(60, lambda w=win: _apply_backdrop(w, "acrylic"))
         win.geometry("430x470")
         win.resizable(False, False)
         win.configure(bg=C_BG)
@@ -2392,7 +2458,7 @@ class GoldMonitorApp:
             return
         win = tk.Toplevel(self.root)
         win.title("我的战绩 · 逐笔买卖盈亏")
-        win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
+        win.after(60, lambda w=win: _apply_backdrop(w, "acrylic"))
         win.geometry("620x540")
         win.minsize(580, 460)
         win.configure(bg=C_BG)
@@ -2578,7 +2644,7 @@ class GoldMonitorApp:
             return
         win = tk.Toplevel(self.root)
         win.title("韭历 · 每日盈亏")
-        win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
+        win.after(60, lambda w=win: _apply_backdrop(w, "acrylic"))
         win.geometry("430x560")
         win.minsize(400, 520)
         win.configure(bg=C_BG)
@@ -2843,7 +2909,7 @@ class GoldMonitorApp:
             return
         win = tk.Toplevel(self.root)
         win.title("金价走势 · 买点地图")
-        win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
+        win.after(60, lambda w=win: _apply_backdrop(w, "acrylic"))
         win.geometry("900x540")
         win.minsize(780, 480)
         win.configure(bg=C_BG)
@@ -3630,7 +3696,7 @@ class GoldMonitorApp:
         is_sell = str(side).lower() == "sell"
         win = tk.Toplevel(self.root)
         win.title("记一笔减仓" if is_sell else "记一笔补仓")
-        win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
+        win.after(60, lambda w=win: _apply_backdrop(w, "acrylic"))
         win.geometry("360x330" if is_sell else "310x300")
         win.resizable(False, False)
         win.configure(bg=C_BG)
@@ -4216,7 +4282,7 @@ class GoldMonitorApp:
             return
         win = tk.Toplevel(self.root)
         win.title("补仓计划价")
-        win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
+        win.after(60, lambda w=win: _apply_backdrop(w, "acrylic"))
         win.geometry("440x460")
         win.minsize(400, 380)
         win.configure(bg=C_BG)
@@ -4513,7 +4579,7 @@ class GoldMonitorApp:
         win = tk.Toplevel(self.root)
         self._wx_win = win
         win.title("微信推送设置")
-        win.after(60, lambda w=win: _dark_title(w, THEME_NAME == "dark"))
+        win.after(60, lambda w=win: _apply_backdrop(w, "acrylic"))
         win.geometry("520x505")
         win.minsize(480, 470)
         win.configure(bg=C_BG)
