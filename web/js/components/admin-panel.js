@@ -53,6 +53,9 @@ window.AdminPanel = {
       this.day = row.day;
       this.price = String(row.price);
     },
+    srcLabel(s) {
+      return { manual: "人工", icbc: "工行", alipay: "支付宝", est: "估算" }[s] || "引擎";
+    },
     copyCode(code) {
       navigator.clipboard && navigator.clipboard.writeText(code);
       pushToast("已复制", code, "plan");
@@ -114,7 +117,7 @@ window.AdminPanel = {
               <tr v-for="s in settles" :key="s.day">
                 <td>{{ s.day }}</td>
                 <td>{{ Number(s.price).toFixed(2) }}</td>
-                <td><span class="tag" :class="s.src === 'manual' ? 'buy' : ''">{{ s.src === 'manual' ? '人工' : '引擎' }}</span></td>
+                <td><span class="tag" :class="s.src === 'manual' || s.src === 'alipay' ? 'buy' : ''">{{ srcLabel(s.src) }}</span></td>
                 <td style="text-align:right"><button class="btn ghost sm" @click="edit(s)">修改</button></td>
               </tr>
             </tbody>
