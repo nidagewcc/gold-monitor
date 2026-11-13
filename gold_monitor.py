@@ -74,6 +74,17 @@ NEWS_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 NEWS_REFRESH_SEC = 600   # 热榜刷新间隔（10 分钟，榜单本身更新不频繁）
 WIN_W = 470              # 主窗口固定宽（轻奢米金版加宽，留白更舒展）
 
+# 积存金交易时段：工行渠道每日 9:10-22:20（含周末，法定节假日以银行公告为准）
+TRADE_OPEN_MIN = 9 * 60 + 10    # 9:10
+TRADE_CLOSE_MIN = 22 * 60 + 20  # 22:20
+
+
+def is_trade_hours(now=None):
+    """当前是否处于积存金交易时段（本地时间 9:10-22:20，含起点不含终点）。"""
+    now = now or datetime.now()
+    cur = now.hour * 60 + now.minute
+    return TRADE_OPEN_MIN <= cur < TRADE_CLOSE_MIN
+
 
 # 工行老站点使用旧版 TLS 重协商，OpenSSL 3 默认拒绝，需要显式放开
 SSL_CONTEXT = ssl.create_default_context()
@@ -1428,6 +1439,8 @@ class GoldMonitorApp:
         self.baseline_set = False
         self.failed_count = 0
         self._online = False  # 行情实时状态（驱动顶部呼吸点）
+        self._market_open = None   # 交易时段状态：True 交易中 / False 已休市 / None 待首刷
+        self._market_job = None    # 交易时段自检定时器句柄（全程只保留一条周期链）
         self._latest_sell = None
         self._latest_high = 0.0
         self._latest_low = 0.0
@@ -1500,6 +1513,26 @@ class GoldMonitorApp:
                             and self._dot.configure(fg=C_GOLD))
         self.root.after(1900, self._pulse_dot)
 
+    def _refresh_market_status(self):
+        """按 9:10-22:20 交易时段刷新顶部徽章（幂等，仅状态翻转时改控件）。"""
+        try:
+            open_now = is_trade_hours()
+            if open_now != self._market_open:
+                self._market_open = open_now
+                if open_now:
+                    self.market_var.set("● 交易中")
+                    self.market_badge.configure(fg=C_GOLD)
+                else:
+                    self.market_var.set("● 已休市")
+                    self.market_badge.configure(fg=C_TXT_3)
+        except Exception:
+            pass
+
+    def _market_tick(self):
+        """交易时段周期自检：跨 9:10 / 22:20 后最迟 30s 翻转徽章。"""
+        self._refresh_market_status()
+        self._market_job = self.root.after(30000, self._market_tick)
+
     def _build_ui(self):
         PAD = 16  # 统一外边距节奏
 
@@ -1526,6 +1559,17 @@ class GoldMonitorApp:
             activebackground=C_BG, activeforeground=C_GOLD_HI,
             command=self._toggle_theme)
         self.theme_btn.pack(side="right")
+        # 交易时段状态徽章（主题按钮左侧）：交易中系统蓝、已休市中性灰
+        self.market_var = tk.StringVar(value="")
+        self.market_badge = tk.Label(
+            title_row, textvariable=self.market_var, bg=C_BG, fg=C_TXT_3,
+            font=(FONT, 9, "bold"), padx=6, pady=2)
+        self.market_badge.pack(side="right", padx=(0, 10))
+        # 重建后强制首刷同步新徽章；周期自检链只启动一次，避免主题切换后多链并存
+        self._market_open = None
+        self._refresh_market_status()
+        if self._market_job is None:
+            self._market_job = self.root.after(30000, self._market_tick)
         sub = tk.Frame(hin, bg=C_BG)
         sub.pack(fill="x", pady=(1, 0))
         self._dot = tk.Label(sub, text="●", bg=C_BG, fg=C_TXT_3,
