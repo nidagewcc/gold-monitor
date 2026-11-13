@@ -32,6 +32,7 @@ class PositionIn(BaseModel):
 
 class TradeIn(BaseModel):
     date: str
+    ts: Optional[str] = None
     grams: float
     amount: float
     kind: str = "buy"

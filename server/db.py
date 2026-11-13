@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS trades(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     date TEXT NOT NULL,
+    ts TEXT,
     grams REAL NOT NULL,
     amount REAL NOT NULL,
     price REAL NOT NULL,
@@ -113,7 +114,13 @@ def get_conn():
 
 def init_db():
     with _lock:
-        get_conn().executescript(SCHEMA)
+        c = get_conn()
+        c.executescript(SCHEMA)
+        # 增量迁移：为旧库补齐 trades.ts 列（可选的精确时间戳）
+        cols = {row[1] for row in c.execute("PRAGMA table_info(trades)").fetchall()}
+        if "ts" not in cols:
+            c.execute("ALTER TABLE trades ADD COLUMN ts TEXT")
+            c.commit()
 
 
 def fetch_all(sql, args=()):

@@ -103,8 +103,15 @@ def main():
         if g <= 0 or a <= 0:
             continue
         day = str(t.get("dt") or t.get("date") or "")[:10]
+        ts_full = str(t.get("dt") or t.get("date") or "").strip()
         if len(day) != 10:
             continue
+        ts_val = ""
+        if len(ts_full) >= 16:
+            # 例如 "2026-11-12 15:32" 或 "2026-11-12T15:32:00"
+            ts_val = ts_full.replace("T", " ")
+            if len(ts_val) == 16:
+                ts_val = ts_val + ":00"
         kind = "sell" if str(t.get("side") or t.get("kind") or "buy").lower() in ("sell", "卖出") else "buy"
         if db.fetch_one(
                 "SELECT id FROM trades WHERE user_id=? AND date=? AND kind=?"
@@ -112,12 +119,12 @@ def main():
                 (uid, day, kind, g, a)):
             skipped += 1
             continue
-        rows.append((uid, day, g, a, a / g, kind, str(t.get("note") or ""), ts_text()))
+        rows.append((uid, day, ts_val or None, g, a, a / g, kind, str(t.get("note") or ""), ts_text()))
     print(f"交易：新增 {len(rows)} 条，已存在 {skipped} 条")
     if rows and not args.dry_run:
         db.executemany(
-            "INSERT INTO trades(user_id, date, grams, amount, price, kind, note, created_at)"
-            " VALUES(?,?,?,?,?,?,?,?)", rows)
+            "INSERT INTO trades(user_id, date, ts, grams, amount, price, kind, note, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)", rows)
 
     # 3) 补仓计划
     plans = cfg.get("plans") or []

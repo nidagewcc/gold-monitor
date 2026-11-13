@@ -4,7 +4,7 @@
   --bg: #eaeaea;
   --card: #ffffff;
   --card-2: #f3f3f3;
-  --line: #e5e5e5;
+  --line: #dcdcdc;
   --accent: #005fb8;
   --accent-hi: #0067c0;
   --accent-dim: #00457a;
@@ -19,7 +19,7 @@
   --hover: #f0f0f0;
   --active: #ebebeb;
   --sel: #ebf3ff;
-  --shadow: 0 1px 2px rgba(0, 0, 0, .06), 0 10px 30px rgba(0, 0, 0, .07);
+  --shadow: 0 1px 2px rgba(0, 0, 0, .05), 0 8px 24px rgba(0, 0, 0, .08);
   --radius: 14px;
 }
 
@@ -249,7 +249,12 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
   padding-top: 16px;
   border-top: 1px solid var(--line);
 }
-.price-cell { min-width: 0; }
+.price-cell {
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--card-2);
+  border-radius: 10px;
+}
 .price-cell .k { font-size: 12px; color: var(--txt-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .price-cell .v { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
 
@@ -339,11 +344,12 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .panel + .panel { margin-top: 18px; }
 
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; align-items: start; }
 .stack { display: flex; flex-direction: column; gap: 14px; }
-.hint { color: var(--txt-3); font-size: 12px; }
+.hint { color: var(--txt-3); font-size: 13px; }
 .grow { flex: 1; min-width: 0; }
-.empty { padding: 26px 10px; text-align: center; color: var(--txt-3); font-size: 13px; }
+.empty { padding: 32px 12px; text-align: center; color: var(--txt-3); font-size: 13px; }
+.empty::before { content: "·"; color: var(--txt-3); margin-right: 6px; }
 
 .form-row {
   display: grid;
@@ -362,38 +368,44 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .btn.danger:hover { background: var(--up-bg); }
 
 /* ============ 数据表 ============ */
-.table-wrap { overflow-x: auto; margin-top: 14px; }
-table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+.table-wrap { overflow-x: auto; margin-top: 14px; border-radius: 10px; border: 1px solid var(--line); }
+table.data { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
 table.data th {
   text-align: left;
   white-space: nowrap;
-  color: var(--txt-3);
+  color: var(--txt-2);
   font-size: 12px;
   font-weight: 600;
-  padding: 8px 10px;
+  padding: 10px 12px;
+  background: var(--card-2);
   border-bottom: 1px solid var(--line);
+  letter-spacing: .3px;
 }
 table.data td {
-  padding: 10px;
+  padding: 12px;
   border-bottom: 1px solid var(--line);
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
 table.data tr:last-child td { border-bottom: 0; }
-table.data tr:hover td { background: var(--hover); }
+table.data tr:hover td { background: var(--sel); }
+.num-col { text-align: right; }
+.when { font-variant-numeric: tabular-nums; color: var(--txt-2); }
+.op-col { text-align: right; width: 82px; }
 .tag {
   display: inline-flex;
   align-items: center;
   height: 22px;
-  padding: 0 8px;
-  border-radius: 6px;
+  padding: 0 10px;
+  border-radius: 999px;
   font-size: 12px;
   font-weight: 600;
   background: var(--card-2);
   color: var(--txt-2);
+  border: 1px solid transparent;
 }
-.tag.buy { background: var(--up-bg); color: var(--up); }
-.tag.sell { background: var(--down-bg); color: var(--down); }
+.tag.buy { background: var(--up-bg); color: var(--up); border-color: color-mix(in srgb, var(--up) 30%, transparent); }
+.tag.sell { background: var(--down-bg); color: var(--down); border-color: color-mix(in srgb, var(--down) 30%, transparent); }
 
 /* ============ 开关 ============ */
 .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }

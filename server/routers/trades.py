@@ -8,11 +8,33 @@ from ..schemas import TradeIn
 router = APIRouter(prefix="/api/trades", tags=["trades"])
 
 
+def _norm_date(s: str) -> str:
+    """取前 10 位作为 YYYY-MM-DD，便于 portfolio 聚合按日期。"""
+    return (s or "").strip()[:10]
+
+
+def _norm_ts(s: str) -> str:
+    """把前端传来的 datetime-local（YYYY-MM-DDTHH:MM 或 THH:MM:SS）规成 YYYY-MM-DD HH:MM:SS。"""
+    v = (s or "").strip()
+    if not v:
+        return ""
+    if "T" in v:
+        v = v.replace("T", " ")
+    # 如果只有 HH:MM，补秒
+    parts = v.split()
+    if len(parts) == 2:
+        t = parts[1]
+        if len(t) == 5:
+            v = f"{parts[0]} {t}:00"
+    return v
+
+
 @router.get("")
 def list_trades(user=Depends(auth.current_user)):
     return db.fetch_all(
-        "SELECT id, date, grams, amount, price, kind, note, created_at "
-        "FROM trades WHERE user_id=? ORDER BY date DESC, id DESC",
+        "SELECT id, date, ts, grams, amount, price, kind, note, created_at "
+        "FROM trades WHERE user_id=? "
+        "ORDER BY COALESCE(NULLIF(ts,''), date, '') DESC, id DESC",
         (user["id"],),
     )
 
@@ -24,10 +46,12 @@ def add_trade(body: TradeIn, user=Depends(auth.current_user)):
     if body.amount <= 0:
         raise HTTPException(400, "金额必须大于 0")
     price = body.price if body.price and body.price > 0 else body.amount / body.grams
+    date = _norm_date(body.date) or db.ts_text()[:10]
+    ts = _norm_ts(body.ts)
     tid = db.execute(
-        "INSERT INTO trades(user_id, date, grams, amount, price, kind, note, created_at) "
-        "VALUES(?,?,?,?,?,?,?,?)",
-        (user["id"], body.date.strip(), float(body.grams), float(body.amount),
+        "INSERT INTO trades(user_id, date, ts, grams, amount, price, kind, note, created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (user["id"], date, ts or None, float(body.grams), float(body.amount),
          float(price), body.kind or "buy", body.note.strip(), db.ts_text()),
     )
     try:
@@ -36,7 +60,7 @@ def add_trade(body: TradeIn, user=Depends(auth.current_user)):
     except Exception:
         pass
     return db.fetch_one(
-        "SELECT id, date, grams, amount, price, kind, note, created_at "
+        "SELECT id, date, ts, grams, amount, price, kind, note, created_at "
         "FROM trades WHERE id=? AND user_id=?", (tid, user["id"]))
 
 
