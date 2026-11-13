@@ -14,4 +14,4 @@ services:
       - ../data:/app/data
     ports:
       # 只监听本机，由宿主机 Nginx 反代并终止 HTTPS
-      - "127.0.0.1:8000:8000"
+      - "8000:8000"
