@@ -255,7 +255,7 @@ class Engine:
               "title": title, "message": message, "price": price, "tier": tier}
         self.broadcast(ev, user_id=uid)
         db.add_alert(uid, ev["kind"], price, json.dumps(ev, ensure_ascii=False))
-        self._push_wx(uid, st, f"{title}\n当前 {price:.2f} 元/克（{ts}）")
+        self._push_wx(uid, st, ev)
 
     def _fire_plan(self, uid, st, target, grams, buy, ts):
         if grams > 0:
@@ -268,18 +268,81 @@ class Engine:
               "price": buy, "target": target, "grams": grams}
         self.broadcast(ev, user_id=uid)
         db.add_alert(uid, "plan", buy, json.dumps(ev, ensure_ascii=False))
-        self._push_wx(uid, st, f"{title}\n当前买入 {buy:.2f} 元/克（{ts}）")
+        self._push_wx(uid, st, ev)
 
-    def _push_wx(self, uid, st, text):
+    def _push_wx(self, uid, st, ev):
         if not st["wx_enabled"]:
             return
         cfg = {
             "wx_appid": st["wx_appid"], "wx_secret": st["wx_secret"],
             "wx_openid": st["wx_openid"], "wx_template_id": st["wx_template_id"],
         }
+        try:
+            data = self._wx_fields(uid, st, ev)
+        except Exception:
+            data = {"header": ev.get("title", ""),
+                    "time_line": now_cn().strftime("%H:%M")}
         with self.lock:
             pusher = self.pushers.setdefault(uid, WeChatPusher())
-        self.executor.submit(pusher.send, cfg, text)
+        self.executor.submit(pusher.send, cfg, data)
+
+    def _wx_fields(self, uid, st, ev):
+        """按微信模板变量组装：header/price_line/tier_line/holding_line/
+        hold_pl_line/today_pl_line/time_line。"""
+        now = now_cn()
+        name = SOURCES.get(st.get("source"), {}).get("name", st.get("source") or "")
+        price = float(ev.get("price") or 0)
+        if ev.get("type") == "test":
+            header = "积存金监控 · 推送测试"
+            tier_line = "收到说明配置没问题"
+        elif ev.get("type") == "plan":
+            header = f"{name} 到补仓计划价"
+            tier_line = f"计划价 {float(ev.get('target') or 0):g} 元"
+        else:
+            verb = "跌破" if ev.get("kind") == "down" else "涨破"
+            header = f"{name} {verb}"
+            tier_line = f"{verb} {float(ev.get('tier') or 0):g} 元"
+        data = {
+            "header": header,
+            "price_line": f"当前 {price:.2f} 元/克",
+            "tier_line": tier_line,
+            "time_line": now.strftime("%H:%M"),
+        }
+        data.update(self._hold_fields(uid, st))
+        return data
+
+    def _hold_fields(self, uid, st):
+        pos = db.fetch_one("SELECT grams, cost FROM positions WHERE user_id=?", (uid,))
+        grams = float(pos["grams"]) if pos else 0.0
+        cost = float(pos["cost"]) if pos else 0.0
+        if grams <= 0 or cost <= 0:
+            return {}
+        sell = (self.latest or {}).get("prices", {}).get("jicun_sell")
+        if not sell:
+            return {"holding_line": f"{grams:g} 克｜投入 {cost:,.0f} 元"}
+        mv = grams * float(sell)
+        pl = mv - cost
+        out = {
+            "holding_line": f"{grams:g} 克｜投入 {cost:,.0f} 元｜市值 {mv:,.0f} 元",
+            "hold_pl_line": f"{pl:+,.2f} 元（{pl / cost * 100:+.2f}%）",
+        }
+        today = self._today_pl(uid, grams, float(sell))
+        if today is not None:
+            out["today_pl_line"] = f"{today:+,.2f} 元（实时）"
+        return out
+
+    @staticmethod
+    def _today_pl(uid, grams, live):
+        from app.portfolio import daily_pl_rows
+        settles = {r["day"]: float(r["price"])
+                   for r in db.fetch_all("SELECT day, price FROM settles")}
+        trades = db.fetch_all(
+            "SELECT date, grams, amount, kind FROM trades WHERE user_id=?", (uid,))
+        today = today_str()
+        rows = daily_pl_rows(settles, [], trades, grams, live_sell=live,
+                             today=today, now_hm=now_cn().strftime("%H:%M"))
+        row = rows.get(today)
+        return float(row["pl"]) if row else None
 
     # ---------- 日结价读写 ----------
     @staticmethod

@@ -52,6 +52,15 @@ def _notify_engine():
         pass
 
 
+def _test_fields(uid):
+    """测试推送也用模板变量，避免模板收到空消息。"""
+    from ..engine import engine
+    snap = engine.latest or {}
+    price = (snap.get("prices") or {}).get("jicun_active")
+    st = engine.users.get(uid) or {}
+    return engine._wx_fields(uid, st, {"type": "test", "price": price or 0})
+
+
 @router.get("")
 def get_wx(user=Depends(auth.current_user)):
     return _payload(user["id"])
@@ -87,7 +96,7 @@ async def test_wx(user=Depends(auth.current_user)):
     pusher = WeChatPusher()
     if not pusher.configured(cfg):
         raise HTTPException(400, "微信参数不完整（appID / appsecret / openid / 模板ID 都要填）")
-    err = await asyncio.to_thread(pusher.send, cfg, "【积存金监控】推送测试成功，收到说明配置没问题。")
+    err = await asyncio.to_thread(pusher.send, cfg, _test_fields(user["id"]))
     if err:
         raise HTTPException(400, err)
     return {"ok": True}
