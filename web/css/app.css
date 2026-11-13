@@ -395,6 +395,8 @@ table.data td {
 table.data tr:last-child td { border-bottom: 0; }
 table.data tr:hover td { background: var(--sel); }
 .num-col { text-align: right; }
+table.data th.num-col { text-align: right; }
+table.data th.op-col { text-align: right; }
 .when { font-variant-numeric: tabular-nums; color: var(--txt-2); }
 .op-col { text-align: right; width: 82px; }
 .tag {
