@@ -1,2 +1,4 @@
-pystray
-Pillow
+fastapi>=0.115
+uvicorn[standard]>=0.30
+itsdangerous>=2.2
+sse-starlette>=2.0

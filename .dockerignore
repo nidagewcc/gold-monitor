@@ -1,0 +1,23 @@
+# 构建上下文瘦身：以下目录/文件不打进镜像上下文
+.git
+.gitignore
+.trae
+.vscode
+data
+*.db
+*.db-shm
+*.db-wal
+__pycache__
+*.pyc
+.env
+error.log
+README.md
+
+# 旧桌面版与本地数据，镜像不需要
+gold_monitor.py
+config.json
+settle_prices.json
+price_history.json
+build
+dist
+*.spec

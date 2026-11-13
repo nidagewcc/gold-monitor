@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>积存金价格监控</title>
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<div id="app" v-cloak>
+  <header class="topbar">
+    <div class="brand">积存金监控</div>
+    <market-badge :market="market"></market-badge>
+    <span class="badge closed" v-if="!s.online" title="实时连接已断开，正在自动重连">离线 · 缓存</span>
+    <div class="spacer"></div>
+    <span class="clock">{{ s.snapshot.date }} {{ s.snapshot.time }}</span>
+    <button class="btn icon ghost" @click="toggleTheme"
+            :title="theme === 'light' ? '切换到深色' : '切换到浅色'">◐</button>
+    <div class="user">
+      <span>{{ username }}</span>
+      <button class="btn ghost" style="min-height:34px;padding:0 12px" @click="logout">退出</button>
+    </div>
+  </header>
+
+  <nav class="tabbar">
+    <button v-for="t in tabs" :key="t.key"
+            :class="{ on: tab === t.key }" @click="go(t.key)">{{ t.label }}</button>
+  </nav>
+
+  <main class="app-wrap">
+    <section v-if="tab === 'market'" class="grid">
+      <div class="col">
+        <price-card :prices="s.snapshot.prices"
+                    :sources="sources"
+                    :source="source"
+                    :time="s.snapshot.time"
+                    :date="s.snapshot.date"
+                    :high="s.snapshot.high"
+                    :low="s.snapshot.low"
+                    :market="market"
+                    :stale="s.stale"></price-card>
+      </div>
+      <div class="col">
+        <position-card :position="s.position" :sell-price="sellPrice" :privacy="privacy"></position-card>
+      </div>
+      <div class="col" style="grid-column:1 / -1">
+        <div class="grid2">
+          <calc-panel :sell-price="sellPrice" :position="s.position" :privacy="privacy"></calc-panel>
+          <avg-down-panel :sell-price="sellPrice" :buy-price="buyPrice"
+                          :position="s.position" :privacy="privacy"></avg-down-panel>
+        </div>
+      </div>
+    </section>
+
+    <section v-else-if="tab === 'chart'">
+      <chart-panel :position="s.position" :privacy="privacy" :source="source"></chart-panel>
+    </section>
+
+    <section v-else-if="tab === 'trades'">
+      <trades-panel></trades-panel>
+    </section>
+
+    <section v-else-if="tab === 'pl'">
+      <pl-calendar></pl-calendar>
+    </section>
+
+    <section v-else-if="tab === 'plans'">
+      <plans-panel :current-price="buyPrice"></plans-panel>
+    </section>
+
+    <section v-else-if="tab === 'settings'">
+      <settings-panel></settings-panel>
+    </section>
+  </main>
+
+  <toast-stack :items="s.toasts"></toast-stack>
+</div>
+
+<script src="/vendor/vue.global.prod.js"></script>
+<script src="/vendor/echarts.min.js"></script>
+<script src="/js/api.js"></script>
+<script src="/js/store.js"></script>
+<script src="/js/components/market-badge.js"></script>
+<script src="/js/components/price-card.js"></script>
+<script src="/js/components/position-card.js"></script>
+<script src="/js/components/toast-stack.js"></script>
+<script src="/js/components/trades-panel.js"></script>
+<script src="/js/components/pl-calendar.js"></script>
+<script src="/js/components/plans-panel.js"></script>
+<script src="/js/components/chart-panel.js"></script>
+<script src="/js/components/settings-panel.js"></script>
+<script src="/js/components/wx-panel.js"></script>
+<script src="/js/components/admin-panel.js"></script>
+<script src="/js/components/calc-panel.js"></script>
+<script src="/js/components/avg-down-panel.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>

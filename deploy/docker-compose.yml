@@ -1,0 +1,17 @@
+services:
+  gold-monitor:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: gold-monitor:latest
+    container_name: gold-monitor
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Shanghai
+      DB_PATH: /app/data/gold.db
+    volumes:
+      - ../data:/app/data
+    ports:
+      # 只监听本机，由宿主机 Nginx 反代并终止 HTTPS
+      - "127.0.0.1:8000:8000"

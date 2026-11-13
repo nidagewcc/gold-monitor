@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · 积存金价格监控</title>
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<div class="auth-wrap">
+  <div class="card auth-card">
+    <div class="auth-brand">
+      <span class="dot"></span>
+      <span class="auth-title">积存金价格监控</span>
+    </div>
+    <p class="auth-sub">工银积存金行情、持仓与补仓提醒</p>
+
+    <div class="tabs">
+      <button id="tab-login" class="on" data-mode="login">登录</button>
+      <button id="tab-register" data-mode="register">注册</button>
+    </div>
+
+    <form id="auth-form" autocomplete="on">
+      <div class="field">
+        <label for="username">用户名</label>
+        <input class="input" id="username" name="username" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="password">密码</label>
+        <input class="input" id="password" name="password" type="password"
+               autocomplete="current-password" required>
+      </div>
+      <div class="field" id="invite-field" style="display:none">
+        <label for="invite">邀请码</label>
+        <input class="input" id="invite" name="invite" placeholder="向管理员索取邀请码">
+      </div>
+      <div class="auth-msg" id="msg"></div>
+      <button class="btn" id="submit-btn" type="submit" style="width:100%">登录</button>
+    </form>
+  </div>
+</div>
+
+<script>
+(function () {
+  var HDR = { "Content-Type": "application/json", "X-Requested-With": "fetch" };
+  var mode = "login";
+  var $ = function (id) { return document.getElementById(id); };
+
+  function msg(text, cls) {
+    var el = $("msg");
+    el.textContent = text || "";
+    el.className = "auth-msg" + (cls ? " " + cls : "");
+  }
+
+  function setMode(m) {
+    mode = m;
+    $("tab-login").className = m === "login" ? "on" : "";
+    $("tab-register").className = m === "register" ? "on" : "";
+    $("submit-btn").textContent = m === "login" ? "登录" : "注册并登录";
+    msg("");
+  }
+
+  $("tab-login").onclick = function () { setMode("login"); };
+  $("tab-register").onclick = function () { setMode("register"); };
+
+  $("auth-form").onsubmit = async function (ev) {
+    ev.preventDefault();
+    var btn = $("submit-btn");
+    btn.disabled = true;
+    msg("");
+    try {
+      var body = {
+        username: $("username").value.trim(),
+        password: $("password").value
+      };
+      if (mode === "register" && $("invite-field").style.display !== "none") {
+        body.invite = $("invite").value.trim();
+      }
+      var resp = await fetch("/api/auth/" + (mode === "login" ? "login" : "register"), {
+        method: "POST", headers: HDR, credentials: "same-origin",
+        body: JSON.stringify(body)
+      });
+      var data = await resp.json().catch(function () { return null; });
+      if (!resp.ok) throw new Error((data && data.detail) || "请求失败（" + resp.status + "）");
+      location.href = "/";
+    } catch (e) {
+      msg(e.message, "err");
+    } finally {
+      btn.disabled = false;
+    }
+  };
+
+  // 已登录直接进首页；同时按需显示邀请码输入框
+  fetch("/api/auth/me", { credentials: "same-origin" })
+    .then(function (r) { if (r.ok) location.href = "/"; })
+    .catch(function () {});
+  fetch("/api/auth/invite-required")
+    .then(function (r) { return r.json(); })
+    .then(function (d) { if (d && d.required) $("invite-field").style.display = ""; })
+    .catch(function () {});
+})();
+</script>
+</body>
+</html>
