@@ -23,6 +23,16 @@ window.TradesPanel = {
       const a = Number(this.form.amount);
       return g > 0 && a > 0 ? a / g : 0;
     },
+    summary() {
+      let fee = 0, realized = 0;
+      this.rows.forEach((r) => {
+        if (r.kind === "sell") {
+          fee += Number(r.fee || 0);
+          realized += Number(r.pl || 0);
+        }
+      });
+      return { fee, realized };
+    },
   },
   mounted() { this.load(); },
   methods: {
@@ -99,6 +109,18 @@ window.TradesPanel = {
     },
     fmt(v, n) { return Number(v).toFixed(n === undefined ? 2 : n); },
     money(v) { return Number(v).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); },
+    signed(v) {
+      if (v === null || v === undefined) return "--";
+      const n = Number(v);
+      return (n >= 0 ? "+" : "-") + Math.abs(n).toLocaleString("zh-CN", {
+        minimumFractionDigits: 2, maximumFractionDigits: 2,
+      });
+    },
+    pct(v) {
+      if (v === null || v === undefined) return "--";
+      const n = Number(v);
+      return (n >= 0 ? "+" : "-") + Math.abs(n).toFixed(2) + "%";
+    },
   },
   template: `
     <div class="card panel">
@@ -106,6 +128,12 @@ window.TradesPanel = {
         <h3>交易记录</h3>
         <span class="hint">买入影响成本与每日盈亏重算，卖出按赎回金额 0.5% 计手续费</span>
       </div>
+
+      <p class="hint" v-if="rows.length" style="margin:-6px 0 12px">
+        补仓盈亏按当前赎回价浮动；减仓盈亏已扣赎回费（0.5%），按成交当时的持仓均价计算。
+        累计手续费 -{{ money(summary.fee) }} 元，减仓已实现盈亏
+        <span :class="summary.realized > 0 ? 'up' : (summary.realized < 0 ? 'down' : '')">{{ signed(summary.realized) }}</span> 元。
+      </p>
 
       <div class="form-row" style="grid-template-columns:repeat(5,minmax(0,1fr))">
         <div class="field">
@@ -150,6 +178,9 @@ window.TradesPanel = {
               <th class="num-col">克数</th>
               <th class="num-col">金额</th>
               <th class="num-col">成交价</th>
+              <th class="num-col">手续费</th>
+              <th class="num-col">盈亏</th>
+              <th class="num-col">收益率</th>
               <th>备注</th>
               <th class="op-col"></th>
             </tr>
@@ -157,10 +188,13 @@ window.TradesPanel = {
           <tbody>
             <tr v-for="r in rows" :key="r.id">
               <td class="when" :title="whenTitle(r)">{{ fmtWhen(r) }}</td>
-              <td><span class="tag" :class="r.kind">{{ r.kind === 'sell' ? '卖出' : '买入' }}</span></td>
+              <td><span class="tag" :class="r.kind">{{ r.kind === 'sell' ? '减仓' : '补仓' }}</span></td>
               <td class="num-col">{{ fmt(r.grams, 4) }}</td>
               <td class="num-col">{{ money(r.amount) }}</td>
               <td class="num-col">{{ fmt(r.price) }}</td>
+              <td class="num-col">{{ r.kind === 'sell' ? '-' + money(r.fee) : '--' }}</td>
+              <td class="num-col" :class="r.pl > 0 ? 'up' : (r.pl < 0 ? 'down' : '')">{{ signed(r.pl) }}</td>
+              <td class="num-col" :class="r.pct > 0 ? 'up' : (r.pct < 0 ? 'down' : '')">{{ pct(r.pct) }}</td>
               <td class="hint">{{ r.note }}</td>
               <td class="op-col"><button class="btn ghost sm" @click="remove(r)">删除</button></td>
             </tr>

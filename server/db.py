@@ -121,6 +121,10 @@ def init_db():
         if "ts" not in cols:
             c.execute("ALTER TABLE trades ADD COLUMN ts TEXT")
             c.commit()
+        # 增量迁移：记录成交当时的持仓均价（用于减仓已实现盈亏）
+        if "cost" not in cols:
+            c.execute("ALTER TABLE trades ADD COLUMN cost REAL")
+            c.commit()
 
 
 def fetch_all(sql, args=()):

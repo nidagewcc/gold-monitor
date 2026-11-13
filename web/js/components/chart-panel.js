@@ -12,6 +12,8 @@ window.ChartPanel = {
       localDays: [],
       localDay: "",
       planPrices: [],
+      trades: [],
+      trendDate: "",
       chart: null,
       timer: null,
     };
@@ -30,6 +32,7 @@ window.ChartPanel = {
   mounted() {
     window.addEventListener("resize", this.resize);
     this.loadPlans();
+    this.loadTrades();
     this.load();
     this.timer = setInterval(() => this.load(true), 180000);
   },
@@ -48,6 +51,54 @@ window.ChartPanel = {
         const rows = await api.get("/api/plans");
         this.planPrices = rows.map((r) => Number(r.price)).filter((p) => p > 0);
       } catch (e) { /* 忽略 */ }
+    },
+    async loadTrades() {
+      try {
+        this.trades = await api.get("/api/trades");
+      } catch (e) { this.trades = []; }
+      this.$nextTick(() => this.draw());
+    },
+    // 把买卖成交映射到当前图的横轴位置
+    tradePoints() {
+      const buy = [];
+      const sell = [];
+      if (this.privacy || !this.trades.length || !this.labels.length) return { buy, sell };
+      const idx = new Map();
+      this.labels.forEach((l, i) => { if (!idx.has(l)) idx.set(l, i); });
+      const toMin = (s) => {
+        const m = /(\d{1,2}):(\d{2})/.exec(s || "");
+        return m ? Number(m[1]) * 60 + Number(m[2]) : -1;
+      };
+      const near = (hm) => {
+        const t = toMin(hm);
+        let best = -1;
+        let bd = 1e9;
+        this.labels.forEach((l, i) => {
+          const v = toMin(l);
+          if (v < 0) return;
+          const d = Math.abs(v - t);
+          if (d < bd) { bd = d; best = i; }
+        });
+        return best;
+      };
+      this.trades.forEach((t) => {
+        const px = Number(t.price);
+        if (!(px > 0)) return;
+        let i = -1;
+        if (this.mode === "daily") {
+          const k = (t.date || "").slice(5);
+          i = idx.has(k) ? idx.get(k) : -1;
+        } else {
+          const day = this.mode === "trend" ? this.trendDate : this.localDay;
+          if ((t.date || "") !== day) return;
+          const hm = (t.ts || "").slice(11, 16);
+          if (!hm) return;
+          i = idx.has(hm) ? idx.get(hm) : near(hm);
+        }
+        if (i < 0) return;
+        (t.kind === "sell" ? sell : buy).push({ value: [i, px], raw: t });
+      });
+      return { buy, sell };
     },
     setMode(m) { if (this.mode !== m) { this.mode = m; } },
     async load(quiet) {
@@ -98,6 +149,7 @@ window.ChartPanel = {
       this.labels = pts.map((p) => p[0].slice(11, 16));
       this.values = pts.map((p) => p[1]);
       this.preClose = d.pre_close ? Number(d.pre_close) : null;
+      this.trendDate = date;
     },
     draw() {
       const el = this.$refs.box;
@@ -137,6 +189,22 @@ window.ChartPanel = {
       }
 
       const step = Math.max(1, Math.ceil(this.labels.length / 8));
+      const pts = this.tradePoints();
+      const extra = [];
+      if (pts.buy.length) {
+        extra.push({
+          type: "scatter", name: "补仓", data: pts.buy,
+          symbol: "triangle", symbolSize: 10, symbolOffset: [0, 8], z: 6,
+          itemStyle: { color: col("--up"), borderColor: col("--card"), borderWidth: 1 },
+        });
+      }
+      if (pts.sell.length) {
+        extra.push({
+          type: "scatter", name: "减仓", data: pts.sell,
+          symbol: "triangle", symbolRotate: 180, symbolSize: 10, symbolOffset: [0, -8], z: 6,
+          itemStyle: { color: col("--down"), borderColor: col("--card"), borderWidth: 1 },
+        });
+      }
       this.chart.setOption({
         animation: false,
         grid: { left: 58, right: 72, top: 24, bottom: 40 },
@@ -146,8 +214,18 @@ window.ChartPanel = {
           borderColor: line,
           textStyle: { color: col("--txt"), fontSize: 12 },
           formatter: (ps) => {
-            const p = ps[0];
-            return `${p.axisValue}<br/>价格 <b>${Number(p.data).toFixed(2)}</b> 元/克`;
+            const main = ps.filter((p) => p.seriesType === "line")[0] || ps[0];
+            let s = `${main.axisValue}<br/>价格 <b>${Number(main.data).toFixed(2)}</b> 元/克`;
+            ps.filter((p) => p.seriesType === "scatter").forEach((p) => {
+              const t = p.data.raw;
+              const g = Number(t.grams).toFixed(4);
+              const px = Number(t.price).toFixed(2);
+              s += `<br/>${t.kind === "sell" ? "减仓" : "补仓"} ${g} 克 @ ${px}`;
+              if (t.pl !== null && t.pl !== undefined) {
+                s += `（${Number(t.pl) >= 0 ? "+" : "-"}${Math.abs(Number(t.pl)).toFixed(2)} 元）`;
+              }
+            });
+            return s;
           },
         },
         xAxis: {
@@ -181,7 +259,7 @@ window.ChartPanel = {
             label: { position: "insideEndTop", fontSize: 11 },
             data: marks,
           },
-        }],
+        }, ...extra],
       }, true);
     },
     rgba(hex, a) {
@@ -229,7 +307,7 @@ window.ChartPanel = {
       <div ref="box" class="chart-box" v-show="!loading && !error && values.length"></div>
 
       <p class="hint" style="margin:12px 0 0">
-        虚线：灰色为持仓成本与昨收，蓝色为补仓计划价。在线行情为黄金9999（Au99.99），与积存金走势基本重合。
+        虚线：灰色为持仓成本与昨收，蓝色为补仓计划价。三角标记为成交点位：红色朝上为补仓，绿色朝下为减仓。在线行情为黄金9999（Au99.99），与积存金走势基本重合。
       </p>
     </div>`,
 };
