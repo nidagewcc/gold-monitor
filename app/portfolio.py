@@ -20,10 +20,12 @@ def daily_pl_rows(settles, est_daily, trades, total_grams,
     today:      实时盈亏所属交易日
     now_hm:     当前 "HH:MM"，默认 "23:59"（视为已收盘）
 
-    口径：
-      当日盈亏 = 当日结算持仓 × (今日价 − 上一交易日日结价) + 卖出已实现盈亏
-      当日结算持仓 = 开盘存量 + 当日买入 − 当日卖出
-      卖出部分按（成交价 − 上一交易日日结价）× 克数 − 赎回手续费（0.5%）
+    口径（与支付宝「收益明细」一致）：
+      当日盈亏 = 期末持仓市值 − 期初持仓市值 − 当日买入金额 + 当日卖出净额
+               = 期末克数 × 今日价 − 期初克数 × 上一交易日日结价
+                 − 当日买入金额 + 当日卖出成交额 × (1 − 0.5% 手续费)
+      当日有买卖时，不能用「期末持仓 × 价差」——那样新买的克数会被当成
+      全天持有，结果与支付宝对不上（例如 11-12 买 7.15 克，误差约 190 元）。
     """
     est_close = {r[0]: float(r[2]) for r in (est_daily or [])}
     close = {}
@@ -85,9 +87,11 @@ def daily_pl_rows(settles, est_daily, trades, total_grams,
         mark = float(live_sell) if is_today else cur_c
         held = grams_open + g_t - s_g
         sell_px = (s_a / s_g) if s_g > 0 else 0.0
-        sell_fee = s_g * sell_px * REDEEM_FEE_RATE if s_g > 0 else 0.0
+        sell_fee = s_a * REDEEM_FEE_RATE if s_g > 0 else 0.0
+        sell_net = s_a - sell_fee
+        # 支付宝口径：当日收益 = 期末市值 − 期初市值 − 当日净买入
+        pl = held * mark - grams_open * prev_c - a_t + sell_net
         sell_pl = (s_g * (sell_px - prev_c) - sell_fee) if s_g > 0 else 0.0
-        pl = held * (mark - prev_c) + sell_pl
         rows[d] = {
             "date": d,
             "close": cur_c if cur_c is not None else mark,
