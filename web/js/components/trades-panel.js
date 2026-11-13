@@ -62,7 +62,7 @@ window.TradesPanel = {
         this.form.grams = "";
         this.form.amount = "";
         this.form.note = "";
-        pushToast("已添加", this._label(row) + " " + row.grams.toFixed(4) + " 克", "plan");
+        pushToast("已添加", this.labelOf(row) + " " + row.grams.toFixed(4) + " 克", "plan");
       } catch (e) {
         pushToast("添加失败", e.message, "up");
       } finally {
@@ -79,10 +79,10 @@ window.TradesPanel = {
         pushToast("删除失败", e.message, "up");
       }
     },
-    _label(row) {
+    labelOf(row) {
       return row.kind === "sell" ? "卖出" : "买入";
     },
-    _fmtWhen(row) {
+    fmtWhen(row) {
       // 表格里显示紧凑的日期/时间戳
       if (row.ts) {
         // 2026-11-12 14:32:00 -> 11-12 14:32
@@ -93,7 +93,7 @@ window.TradesPanel = {
       // 只有日期：2026-11-12 -> 11-12
       return (row.date || "").slice(5, 10);
     },
-    _whenTitle(row) {
+    whenTitle(row) {
       // hover 时显示完整值
       return row.ts ? row.ts : row.date;
     },
@@ -156,7 +156,7 @@ window.TradesPanel = {
           </thead>
           <tbody>
             <tr v-for="r in rows" :key="r.id">
-              <td class="when" :title="_whenTitle(r)">{{ _fmtWhen(r) }}</td>
+              <td class="when" :title="whenTitle(r)">{{ fmtWhen(r) }}</td>
               <td><span class="tag" :class="r.kind">{{ r.kind === 'sell' ? '卖出' : '买入' }}</span></td>
               <td class="num-col">{{ fmt(r.grams, 4) }}</td>
               <td class="num-col">{{ money(r.amount) }}</td>

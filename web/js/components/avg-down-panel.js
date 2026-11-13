@@ -82,7 +82,7 @@ window.AvgDownPanel = {
           </div>
         </div>
       </div>
-      <p class="hint" style="margin:12px 0 0">
+      <p class="hint" style="margin:auto 0 0;padding-top:12px">
         回本 = 赎回价回到摊薄均价；月数为纯数学参考，金价走势无法预测。
       </p>
     </div>`,

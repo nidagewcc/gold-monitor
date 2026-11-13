@@ -72,7 +72,7 @@ window.CalcPanel = {
           <span class="v">{{ maskComputed ? '****' : restG.toFixed(4) + ' 克 · 成本 ' + money(restCost) + ' 元' }}</span>
         </div>
       </div>
-      <p class="hint" style="margin:12px 0 0">
+      <p class="hint" style="margin:auto 0 0;padding-top:12px">
         按当日实时赎回价成交，资金一般 T+5 个工作日到账；兑换实物金条不按此收费。实际以工行办理时为准。
       </p>
     </div>`,

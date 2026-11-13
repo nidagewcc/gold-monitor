@@ -11,9 +11,16 @@ window.PriceCard = {
     cells() {
       const keys = ["jicun_active", "jicun_sell", "ruyi_active", "au9999"];
       const p = this.prices || {};
+      const short = {
+        jicun_active: "主动买入",
+        jicun_sell: "赎回价",
+        ruyi_active: "如意金",
+        au9999: "Au99.99",
+      };
       return keys.map((k) => ({
         key: k,
-        name: (this.sources && this.sources[k]) || k,
+        name: short[k] || k,
+        full: (this.sources && this.sources[k]) || k,
         value: p[k],
       }));
     },
@@ -42,7 +49,7 @@ window.PriceCard = {
         <span v-if="low"> · 日内最低 {{ fmt(low) }}</span>
       </div>
       <div class="price-grid">
-        <div class="price-cell" v-for="c in cells" :key="c.key">
+        <div class="price-cell" v-for="c in cells" :key="c.key" :title="c.full">
           <div class="k">{{ c.name }}</div>
           <div class="v num">{{ fmt(c.value) }}</div>
         </div>
