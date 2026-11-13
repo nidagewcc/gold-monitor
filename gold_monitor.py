@@ -66,12 +66,6 @@ EM_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebK
 EM_TRENDS_TTL = 60     # 分时缓存秒数（交易时段内 1 分钟刷新一次即可）
 EM_KLINE_TTL = 1800    # 日K缓存秒数
 
-# 财经热搜弹窗：百度热搜·财经榜（免鉴权公开接口），按榜单排名/热度展示
-BAIDU_FIN_URL = "https://top.baidu.com/api/board?platform=pc&tab=finance"
-NEWS_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 Chrome/120 Safari/537.36",
-                "Referer": "https://top.baidu.com/board?tab=finance"}
-NEWS_REFRESH_SEC = 600   # 热榜刷新间隔（10 分钟，榜单本身更新不频繁）
 WIN_W = 470              # 主窗口固定宽（轻奢米金版加宽，留白更舒展）
 
 # 积存金交易时段：工行渠道每日 9:10-22:20（含周末，法定节假日以银行公告为准）
@@ -842,51 +836,6 @@ def fetch_em_daily(beg, end):
     return out
 
 
-# ---------- 财经热搜（百度热搜·财经榜，免鉴权公开接口） ----------
-
-def _format_hot(score):
-    """hotScore 原始整数转可读热度：4842720 -> '484万'，过亿 -> '1.2亿'。"""
-    try:
-        n = int(score)
-    except (TypeError, ValueError):
-        return ""
-    if n >= 100000000:
-        return "%g亿" % round(n / 100000000, 1)
-    if n >= 10000:
-        return "%d万" % round(n / 10000)
-    return str(n)
-
-
-def fetch_finance_hot():
-    """拉取百度热搜·财经榜（约 30 条）。
-    返回 [{"rank": 排名, "word": 标题, "url": 链接(rawUrl), "hot": 热度整数}, ...]，
-    按榜单 index 升序。失败抛异常。"""
-    req = urllib.request.Request(BAIDU_FIN_URL, headers=NEWS_HEADERS)
-    with urllib.request.urlopen(req, timeout=10, context=SSL_CONTEXT) as resp:
-        d = json.loads(resp.read().decode("utf-8", "ignore"))
-    cards = ((d.get("data") or {}).get("cards")) or []
-    content = cards[0].get("content") if cards else None
-    if not content:
-        raise RuntimeError("百度财经榜返回为空")
-    items = []
-    for r in content:
-        word = (r.get("word") or "").strip()
-        if not word:
-            continue
-        items.append({
-            "rank": r.get("index", len(items)) + 1,
-            "word": word,
-            "url": r.get("rawUrl") or r.get("url") or "",
-            "hot": r.get("hotScore") or 0,
-            "desc": (r.get("desc") or "").strip(),       # 一句话简介（财经榜通常为空）
-            "change": str(r.get("hotChange", "")).strip().lower(),  # up / down / same
-            "tag": str(r.get("hotTag", "")).strip(),     # "1" 新 / "3" 沸 / "0" 无
-        })
-    items.sort(key=lambda x: x["rank"])
-    return items
-
-
-
 def daily_pl_rows(settles, est_daily, trades, total_grams,
                   live_sell=None, today=None, now_hm=None):
     """根据每晚 22:20 日结价与买入明细，逐日重算每日盈亏（支付宝同口径）。
@@ -1466,13 +1415,6 @@ class GoldMonitorApp:
         self._em_loading = set()  # 正在后台拉取的 key，避免重复请求
         self._chart_seq = 0  # 走势图绘制代际令牌，丢弃切模式前在途的在线回调
 
-        # 财经热搜弹窗（默认不主动拉取，打开弹窗才加载）
-        self._news_items = []      # [{"rank","word","url","hot",...}] 排名升序
-        self._news_loading = False
-        self._news_list_win = None
-        self._news_last_fetch = 0.0  # 上次成功拉取时间戳（弹窗内节流）
-        self._news_last_ok = ""      # 上次成功拉取的 "HH:MM"（弹窗副标题展示）
-
         # 微信测试号推送：token 缓存挂在实例上，配置存 config.json
         self._wx_pusher = WeChatPusher()
         self._wx_busy = False        # 测试推送进行中（防连点）
@@ -1659,7 +1601,6 @@ class GoldMonitorApp:
         tool_btn(1, 0, "战绩", self._open_trades)
         tool_btn(1, 1, "韭历", self._open_pl_calendar)
         tool_btn(1, 2, "走势图", self._open_chart)
-        tool_btn(2, 0, "财经热搜", self._open_news_list, cspan=3, accent=True)
 
         # 市值：小标签在上，大数字在下，层级清晰
         tk.Label(pos, text="实时市值", bg=C_CARD, fg=C_TXT_2,
@@ -1828,243 +1769,6 @@ class GoldMonitorApp:
         self.root.update_idletasks()
         self._fit_window()
 
-    # ---- 财经热搜弹窗（按需打开，平时不占主界面、不后台取数）----
-    def _open_news_list(self):
-        """财经热搜榜：独立弹窗完整榜单，打开才拉取，弹窗打开期间每 10 分钟自动刷新。"""
-        if self._news_list_win is not None:
-            try:
-                if tk.Toplevel.winfo_exists(self._news_list_win):
-                    self._news_list_win.lift()
-                    self._news_list_win.focus_force()
-                    return
-            except Exception:
-                pass
-
-        win = tk.Toplevel(self.root)
-        self._news_list_win = win
-        win.title("财经热搜 · 百度热搜财经榜")
-        win.configure(bg=C_BG)
-        win.geometry("500x640")
-        win.minsize(440, 480)
-        win.transient(self.root)
-        win.after(60, lambda w=win: _apply_backdrop(w, "acrylic"))
-
-        meta = {"job": None}       # 自动刷新 after 句柄
-
-        def on_close():
-            if meta["job"] is not None:
-                try:
-                    win.after_cancel(meta["job"])
-                except Exception:
-                    pass
-                meta["job"] = None
-            self._news_list_win = None
-            win.destroy()
-        win.protocol("WM_DELETE_WINDOW", on_close)
-
-        # 顶部金色细线 + 标题行
-        tk.Frame(win, bg=C_GOLD, height=2).pack(fill="x")
-        head = tk.Frame(win, bg=C_BG)
-        head.pack(fill="x", padx=18, pady=(14, 2))
-        tk.Label(head, text="财经热搜", bg=C_BG, fg=C_GOLD_HI,
-                 font=(FONT, 14, "bold")).pack(side="left")
-        refresh_btn = tk.Label(head, text="↻ 刷新", bg=C_BG, fg=C_GOLD,
-                               font=(FONT, 9), cursor="hand2")
-        refresh_btn.pack(side="right")
-
-        self._news_sub_var = tk.StringVar(value="百度热搜 · 财经榜")
-        tk.Label(win, textvariable=self._news_sub_var, bg=C_BG, fg=C_TXT_3,
-                 font=(FONT, 8), anchor="w").pack(fill="x", padx=18, pady=(0, 8))
-
-        # 榜单卡：Canvas + 内嵌 Frame 实现滚动
-        box = tk.Frame(win, bg=C_CARD, highlightbackground=C_LINE,
-                       highlightthickness=1)
-        box.pack(fill="both", expand=True, padx=16, pady=(0, 6))
-        canvas = tk.Canvas(box, bg=C_CARD, highlightthickness=0, bd=0)
-        vsb = ttk.Scrollbar(box, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        rows = tk.Frame(canvas, bg=C_CARD)
-        rows_id = canvas.create_window((0, 0), window=rows, anchor="nw")
-
-        def on_rows_configure(_e=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        rows.bind("<Configure>", on_rows_configure)
-
-        def on_canvas_configure(e):
-            canvas.itemconfigure(rows_id, width=e.width)
-        canvas.bind("<Configure>", on_canvas_configure)
-
-        def on_wheel(e):
-            canvas.yview_scroll(int(-e.delta / 120), "units")
-        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", on_wheel))
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
-
-        hint_var = tk.StringVar(value="榜单加载中…")
-
-        def render():
-            if not win.winfo_exists():
-                return
-            for w in rows.winfo_children():
-                w.destroy()
-            data = self._news_items
-            if not data:
-                hint_lbl = tk.Label(rows, textvariable=hint_var, bg=C_CARD,
-                                    fg=C_TXT_3, font=(FONT, 9), pady=40)
-                hint_lbl.pack()
-                return
-            for n in data:
-                self._news_row(rows, n)
-
-        def set_subtitle(note=""):
-            if not win.winfo_exists():
-                return
-            t = "百度热搜 · 财经榜"
-            if self._news_last_ok:
-                t += " · 更新于 " + self._news_last_ok
-            t += " · 每 %d 分钟自动刷新" % (NEWS_REFRESH_SEC // 60)
-            if note:
-                t += " · " + note
-            self._news_sub_var.set(t)
-
-        def loaded(data, err):
-            self._news_loading = False
-            if not win.winfo_exists():
-                return
-            refresh_btn.configure(fg=C_GOLD)
-            if err is None and data:
-                self._news_items = data
-                self._news_last_fetch = time.time()
-                self._news_last_ok = datetime.now().strftime("%H:%M")
-                render()
-                set_subtitle()
-            elif self._news_items:
-                set_subtitle("刷新失败，继续显示旧榜单")
-            else:
-                hint_var.set("榜单获取失败，点右上角“刷新”重试")
-                render()
-            try:
-                meta["job"] = win.after(NEWS_REFRESH_SEC * 1000,
-                                        lambda: self._news_load(True, loaded))
-            except Exception:
-                pass
-
-        def manual_refresh(_e=None):
-            if self._news_loading:
-                return
-            refresh_btn.configure(fg=C_TXT_3)
-            self._news_load(True, loaded)
-        refresh_btn.bind("<Button-1>", manual_refresh)
-        refresh_btn.bind("<Enter>", lambda _e: refresh_btn.configure(fg=C_GOLD_HI))
-        refresh_btn.bind("<Leave>", lambda _e: refresh_btn.configure(fg=C_GOLD))
-
-        # 首次：有 10 分钟内缓存直接用，否则后台拉取
-        if self._news_items and time.time() - self._news_last_fetch < NEWS_REFRESH_SEC:
-            render()
-            set_subtitle()
-            try:
-                meta["job"] = win.after(NEWS_REFRESH_SEC * 1000,
-                                        lambda: self._news_load(True, loaded))
-            except Exception:
-                pass
-        else:
-            render()
-            self._news_load(True, loaded)
-
-        ttk.Button(win, text="关闭", command=on_close).pack(pady=(2, 14))
-
-    def _news_row(self, parent, n):
-        """榜单中的一行：排名徽章 + 标题（热/新/沸标签）+ 热度与升降 + 简介。"""
-        row = tk.Frame(parent, bg=C_CARD)
-        row.pack(fill="x", padx=14, pady=(8, 0))
-
-        top = tk.Frame(row, bg=C_CARD)
-        top.pack(fill="x")
-        rank = n.get("rank", 0)
-        r_bg = C_GOLD if rank <= 3 else C_CARD_2
-        r_fg = C_ON_GOLD if rank <= 3 else C_TXT_2
-        tk.Label(top, text=str(rank), bg=r_bg, fg=r_fg, width=2,
-                 font=(FONT, 9, "bold"), padx=2, pady=1).pack(side="left",
-                                                               anchor="n")
-        mid = tk.Frame(top, bg=C_CARD)
-        mid.pack(side="left", fill="x", expand=True, padx=(8, 0))
-        tline = tk.Frame(mid, bg=C_CARD)
-        tline.pack(fill="x")
-        has_url = bool(n.get("url"))
-        title = tk.Label(tline, text=n["word"], bg=C_CARD,
-                         fg=C_GOLD_HI if has_url else C_TXT,
-                         font=(FONT, 10, "bold"), anchor="w", justify="left",
-                         wraplength=310, cursor="hand2" if has_url else "arrow")
-        title.pack(side="left")
-        tag_map = {"1": ("新", C_DOWN), "3": ("沸", C_UP)}
-        tag_label, tag_fg = tag_map.get(n.get("tag", ""), ("", C_GOLD))
-        if tag_label:
-            tk.Label(tline, text=tag_label, bg=C_CARD, fg=tag_fg,
-                     font=(FONT, 8, "bold"), padx=2).pack(side="left", padx=(4, 0))
-
-        hotline = tk.Frame(top, bg=C_CARD)
-        hotline.pack(side="right", anchor="n", padx=(8, 0))
-        change = n.get("change", "")
-        if change in ("up", "down"):
-            arrow, c_fg = ("▲", C_UP) if change == "up" else ("▼", C_DOWN)
-            tk.Label(hotline, text=arrow, bg=C_CARD, fg=c_fg,
-                     font=(FONT, 8)).pack(side="left")
-        hot = _format_hot(n.get("hot"))
-        if hot:
-            tk.Label(hotline, text=hot, bg=C_CARD, fg=C_TXT_2,
-                     font=(FONT, 9, "bold")).pack(side="left", padx=(3, 0))
-
-        desc = n.get("desc", "")
-        if desc:
-            tk.Label(mid, text=desc, bg=C_CARD, fg=C_TXT_3,
-                     font=(FONT, 8), anchor="w", justify="left",
-                     wraplength=360).pack(fill="x", pady=(2, 0))
-
-        tk.Frame(parent, bg=C_LINE, height=1).pack(fill="x", padx=14, pady=(8, 0))
-
-        if has_url:
-            def open_url(_e=None, u=n["url"]):
-                try:
-                    webbrowser.open(u)
-                except Exception:
-                    pass
-            for w in (row, top, mid, tline, title):
-                w.bind("<Button-1>", open_url)
-            title.bind("<Enter>", lambda _e: title.configure(fg=C_GOLD))
-            title.bind("<Leave>",
-                       lambda _e: title.configure(fg=C_GOLD_HI))
-
-    def _news_load(self, force, callback):
-        """后台拉取财经榜；成功/失败均在 UI 线程回调 (data, err)。带 10 分钟节流。"""
-        if self._news_loading:
-            return
-        if not force and self._news_items and \
-                time.time() - self._news_last_fetch < NEWS_REFRESH_SEC:
-            callback(self._news_items, None)
-            return
-        self._news_loading = True
-
-        def work():
-            data, err = None, None
-            try:
-                data = fetch_finance_hot()
-            except Exception as e:
-                err = e
-
-            def ui():
-                self._news_loading = False
-                if not self.root.winfo_exists():
-                    return
-                callback(data, err)
-            try:
-                self.root.after(0, ui)
-            except Exception:
-                pass
-
-        threading.Thread(target=work, daemon=True).start()
-
-
     def _toggle_theme(self):
         new_name = "light" if THEME_NAME == "dark" else "dark"
         self.cfg["theme"] = new_name
@@ -2083,13 +1787,6 @@ class GoldMonitorApp:
                         closer()
                     except Exception:
                         pass
-        # 财经热搜弹窗没有独立 close 方法，直接销毁
-        if self._news_list_win is not None:
-            try:
-                self._news_list_win.destroy()
-            except Exception:
-                pass
-            self._news_list_win = None
         # 微信推送设置窗同理，避免残留旧配色
         if getattr(self, "_wx_win", None) is not None:
             try:
