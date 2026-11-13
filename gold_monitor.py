@@ -80,6 +80,13 @@ def is_trade_hours(now=None):
     return TRADE_OPEN_MIN <= cur < TRADE_CLOSE_MIN
 
 
+# 收盘日结价定格与休市暂停（见 _settle_observe / _schedule_next）
+SETTLE_WATCH_MIN = 22 * 60 + 20   # 22:20 起进入收盘观察，不再按整点首次报价锁定
+SETTLE_DEADLINE_MIN = 22 * 60 + 35  # 22:35 硬截止：凑不齐连续同价也强制锁定当晚日结价
+SETTLE_STABLE_N = 3               # 赎回价连续 N 次不变即判定银行报价已停更、收盘定格
+IDLE_WAKE_MS = 60000              # 休市暂停后的唤醒检查间隔（仅看时间、不发网络请求）
+
+
 # 工行老站点使用旧版 TLS 重协商，OpenSSL 3 默认拒绝，需要显式放开
 SSL_CONTEXT = ssl.create_default_context()
 SSL_CONTEXT.options |= 0x4  # ssl.OP_LEGACY_SERVER_CONNECT
@@ -1406,7 +1413,12 @@ class GoldMonitorApp:
         self._hist_dirty = False
         self._last_hist_save = 0.0
         self._settles = load_settles()  # 本地日结价 {交易日: {"price","src"}}
-        self._settle_recorded_day = None  # 本次运行已自动记录日结价的交易日（防重）
+        # 收盘日结价定格状态机（22:20 后连续同价判定，替代旧的整点窗口首抓即锁）
+        self._settle_day = None        # 当前观察的交易日，跨天自动重置
+        self._settle_last = None       # 观察期内上一笔有效赎回价
+        self._settle_same = 0          # 赎回价连续相同次数
+        self._settle_locked = False    # 当晚日结价是否已锁定（锁定后即切入休市暂停）
+        self._market_paused = False    # 休市暂停：停止行情请求，仅保留分钟级唤醒检查
         # 补仓计划到价状态：{计划价: 是否已弹过提醒}；首个买入价建立基线，
         # 基线价之下的计划默认已触发状态（不打扰），价格涨回去后重新武装
         self._plans_fired = None
@@ -3816,24 +3828,56 @@ class GoldMonitorApp:
             f"[{datetime.now():%H:%M:%S}] 行情获取失败（连续 {self.failed_count} 次）：{err}")
         self._schedule_next()
 
-    def _maybe_record_settle(self, sell):
-        """工作日 22:20 交易截止那一刻，用工行积存金实时报价记录当日日结价。
-        该价即支付宝每日收益口径（同一工银积存金、同一 22:20 截止自报价）。
-        22:20 后的接口报价只是跟随夜盘变动的参考价，故只在 22:20-22:24 窗口内
-        抓第一次有效报价即锁定、绝不刷新；人工录入（alipay）永不覆盖。"""
-        now = datetime.now()
-        hm = now.strftime("%H:%M")
-        if not sell or now.weekday() >= 5 or not ("22:20" <= hm <= "22:24"):
-            return
-        day = now.strftime("%Y-%m-%d")
-        old = self._settles.get(day)
-        if old:
-            return  # 当晚已锁定（icbc）或是人工精确价（alipay），都不再覆盖
-        price = float(sell)
-        self._settles[day] = {"price": price, "src": "icbc"}
+    def _lock_settle(self, sell, day):
+        """用工行积存金赎回价锁定当日日结价（支付宝同口径）。
+        人工录入（alipay）或当晚已锁定（icbc）均不覆盖。"""
+        if not sell:
+            return False
+        if self._settles.get(day):
+            self._settle_locked = True
+            return True
+        self._settles[day] = {"price": float(sell), "src": "icbc"}
         self._settles = dict(sorted(self._settles.items()))
         save_settles(self._settles)
-        self._settle_recorded_day = day
+        self._settle_locked = True
+        return True
+
+    def _settle_observe(self, sell):
+        """22:20 收盘观察：用赎回价连续 N 次不变判定银行报价已停更（收盘定格），
+        替代旧的“22:20-22:24 首抓即锁”——接口整点有延迟时旧法易把盘中旧价当结算价。
+        价格仍在变就清零计数；连续 SETTLE_STABLE_N 次相同即锁定；
+        到 22:35 硬截止仍未稳定则强制用最后一笔有效价锁定，保证当晚一定有日结价。
+        锁定后置休市暂停标记，由 _schedule_next 切入零请求唤醒链。"""
+        now = datetime.now()
+        day = now.strftime("%Y-%m-%d")
+        cur = now.hour * 60 + now.minute
+        if self._settle_day != day:
+            # 跨天（或首次进入观察）重置状态机
+            self._settle_day = day
+            self._settle_last = None
+            self._settle_same = 0
+            self._settle_locked = False
+        if self._settle_locked or cur < SETTLE_WATCH_MIN:
+            return
+        # 已有人工/历史精确价：无需再观察，直接进入暂停
+        if self._settles.get(day):
+            self._settle_locked = True
+            self._market_paused = True
+            return
+        if sell:
+            if self._settle_last is not None and float(sell) == self._settle_last:
+                self._settle_same += 1
+            else:
+                self._settle_last = float(sell)
+                self._settle_same = 1
+            if self._settle_same >= SETTLE_STABLE_N:
+                self._lock_settle(sell, day)
+                self._market_paused = True
+                return
+        # 硬截止：无论是否凑齐连续同价，用最后一笔有效价强制锁定
+        if cur >= SETTLE_DEADLINE_MIN:
+            if self._lock_settle(self._settle_last or sell, day):
+                self._market_paused = True
 
     def _on_data(self, data):
         self.failed_count = 0
@@ -3865,8 +3909,8 @@ class GoldMonitorApp:
                 save_history(self._hist)
                 self._hist_dirty = False
                 self._last_hist_save = now_ts
-        # 22:20 交易截止：用工行积存金报价锁定当日日结价（支付宝同口径）
-        self._maybe_record_settle(sell0)
+        # 22:20 收盘观察：赎回价连续定格后锁定当日日结价（支付宝同口径），并切入休市暂停
+        self._settle_observe(sell0)
         self._set_trade_date(data.get("date"))
         self._render_position()
         if self._trades_win is not None:
@@ -4458,8 +4502,36 @@ class GoldMonitorApp:
         if interval != self.cfg["interval"]:
             self.cfg["interval"] = interval
             self._persist()
-        if not self.stop_event.is_set():
+        if self.stop_event.is_set():
+            return
+        # 时间为最终裁决：交易时段 + 收盘观察期（未锁定前）正常轮询；
+        # 锁定后或其余休市时间一律走零请求唤醒链，手动“立即刷新”也不会带回正常节奏
+        if self._in_poll_window():
             self.root.after(interval * 1000, self._poll_once)
+        else:
+            self.root.after(IDLE_WAKE_MS, self._wake_check)
+
+    def _in_poll_window(self, now=None):
+        """是否应保持正常行情轮询：9:10-22:20 交易时段，或 22:20-22:35 收盘观察期
+        （日结价尚未锁定，需继续拉价做连续同价判定）。锁定后/其余时间返回 False。"""
+        now = now or datetime.now()
+        cur = now.hour * 60 + now.minute
+        if TRADE_OPEN_MIN <= cur < SETTLE_WATCH_MIN:
+            return True
+        if SETTLE_WATCH_MIN <= cur < SETTLE_DEADLINE_MIN and not self._settle_locked:
+            return True
+        return False
+
+    def _wake_check(self):
+        """休市期间的分钟级唤醒：只看时间不请求。回到轮询窗口立即拉新价，
+        比单次长定时器更耐系统休眠/UI 重建；未到点则继续挂下一分钟检查。"""
+        if self.stop_event.is_set():
+            return
+        if self._in_poll_window():
+            self._market_paused = False
+            self._poll_once()
+        else:
+            self.root.after(IDLE_WAKE_MS, self._wake_check)
 
     def _persist(self):
         self.cfg["sound"] = bool(self.sound_var.get())
