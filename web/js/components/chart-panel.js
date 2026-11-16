@@ -7,6 +7,8 @@ window.ChartPanel = {
       loading: true,
       error: "",
       labels: [],
+      // daily 模式下与 labels 等长的完整 YYYY-MM-DD，用于成交点定位，避免 MM-DD 跨年撞键
+      fullLabels: [],
       values: [],
       preClose: null,
       localDays: [],
@@ -86,8 +88,10 @@ window.ChartPanel = {
         if (!(px > 0)) return;
         let i = -1;
         if (this.mode === "daily") {
-          const k = (t.date || "").slice(5);
-          i = idx.has(k) ? idx.get(k) : -1;
+          // 用完整 YYYY-MM-DD 建索引，避免横跨整年时 MM-DD 跨年重复导致定位到上一年
+          const keys = this.fullLabels.length ? this.fullLabels : this.labels;
+          const key = (t.date || "").slice(0, 10);
+          i = keys.indexOf(key);
         } else {
           const day = this.mode === "trend" ? this.trendDate : this.localDay;
           if ((t.date || "") !== day) return;
@@ -106,16 +110,19 @@ window.ChartPanel = {
       try {
         if (this.mode === "trend") {
           const d = await api.get("/api/market/chart?mode=trend", 45000);
+          this.fullLabels = [];
           this.applyTrend(d);
         } else if (this.mode === "daily") {
           const d = await api.get("/api/market/chart?mode=daily", 45000);
           const rows = d.rows || [];
+          this.fullLabels = rows.map((r) => r[0]);
           this.labels = rows.map((r) => r[0].slice(5));
           this.values = rows.map((r) => r[2]);
           this.preClose = null;
         } else {
           const q = this.localDay ? `&day=${this.localDay}` : "";
           const d = await api.get(`/api/market/chart?mode=local${q}`, 45000);
+          this.fullLabels = [];
           this.localDays = d.days || [];
           this.localDay = d.day || "";
           const pts = d.points || [];
@@ -129,10 +136,12 @@ window.ChartPanel = {
         this.values = [];
       } finally {
         this.loading = false;
-        this.$nextTick(() => {
+        // v-show 刚从 display:none 恢复，单帧 nextTick 时 clientHeight 可能仍为 0；
+        // 用双 requestAnimationFrame 等浏览器完成布局后再 init/draw，否则 draw 会被尺寸守卫拦下
+        this.$nextTick(() => requestAnimationFrame(() => requestAnimationFrame(() => {
           if (this.chart) this.chart.resize();
           this.draw();
-        });
+        })));
       }
     },
     applyTrend(d) {
