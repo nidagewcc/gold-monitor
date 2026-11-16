@@ -6,6 +6,7 @@
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 
 from app.timeutil import ts_text
 
@@ -161,6 +162,20 @@ def executemany(sql, rows):
         c = get_conn()
         c.executemany(sql, rows)
         c.commit()
+
+
+@contextmanager
+def transaction():
+    """显式事务：块内多条写语句要么一起提交，要么一起回滚。"""
+    with _lock:
+        c = get_conn()
+        try:
+            c.execute("BEGIN")
+            yield c
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
 
 
 def add_alert(user_id, kind, price, payload=""):

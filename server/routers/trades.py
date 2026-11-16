@@ -77,6 +77,57 @@ def list_trades(user=Depends(auth.current_user)):
     return _enrich(rows)
 
 
+def _get_position(conn, uid):
+    r = conn.execute("SELECT grams, cost FROM positions WHERE user_id=?", (uid,)).fetchone()
+    if r is None:
+        conn.execute("INSERT INTO positions(user_id) VALUES(?)", (uid,))
+        return 0.0, 0.0
+    return float(r["grams"] or 0), float(r["cost"] or 0)
+
+
+def _apply_to_position(conn, uid, grams, amount, kind):
+    """把一笔成交联动到持仓，返回 (新克数, 新成本, 成交时均价)。
+
+    买入：克数与成本同增，均价被自然摊薄/拉高；
+    卖出：按当前持仓均价结转成本，剩余克数均价不变。
+    """
+    g, cost = _get_position(conn, uid)
+    avg_before = (cost / g) if g > 0 else 0.0
+    if kind == "sell":
+        if grams > g + 1e-9:
+            raise HTTPException(400, f"卖出克数超过当前持仓（当前 {g:.4f} 克）")
+        g -= grams
+        cost -= avg_before * grams
+        if g <= 1e-9:  # 清仓后成本归零，避免浮点残差
+            g, cost = 0.0, 0.0
+    else:
+        g += grams
+        cost += amount
+    conn.execute(
+        "UPDATE positions SET grams=?, cost=? WHERE user_id=?", (g, cost, uid))
+    return g, cost, avg_before
+
+
+def _revert_position(conn, uid, grams, amount, kind, avg_at_trade):
+    """删除成交时反向冲销其对持仓的影响。"""
+    g, cost = _get_position(conn, uid)
+    if kind == "sell":
+        # 撤销卖出：把克数加回，成本按该笔成交时均价补回
+        g += grams
+        cost += avg_at_trade * grams
+    else:
+        # 撤销买入：克数与成本同减
+        if grams > g + 1e-9:
+            raise HTTPException(400, "回滚后持仓克数为负，请先核对交易记录")
+        g -= grams
+        cost -= amount
+        if g <= 1e-9:
+            g, cost = 0.0, 0.0
+    conn.execute(
+        "UPDATE positions SET grams=?, cost=? WHERE user_id=?", (g, cost, uid))
+    return g, cost
+
+
 @router.post("")
 def add_trade(body: TradeIn, user=Depends(auth.current_user)):
     if body.grams <= 0:
@@ -87,18 +138,24 @@ def add_trade(body: TradeIn, user=Depends(auth.current_user)):
     date = _norm_date(body.date) or db.ts_text()[:10]
     ts = _norm_ts(body.ts)
     kind = body.kind or "buy"
-    # 减仓时记下成交当时的持仓均价，用于事后算这一笔的已实现盈亏
-    cost = 0.0
-    if kind == "sell":
-        pos = db.fetch_one("SELECT grams, cost FROM positions WHERE user_id=?", (user["id"],))
-        if pos and float(pos["grams"] or 0) > 0:
+    uid = user["id"]
+    grams, amount = float(body.grams), float(body.amount)
+
+    with db.transaction() as conn:
+        # 减仓时先取成交当时的持仓均价，再联动扣减持仓
+        pos = conn.execute(
+            "SELECT grams, cost FROM positions WHERE user_id=?", (uid,)).fetchone()
+        cost = 0.0
+        if kind == "sell" and pos and float(pos["grams"] or 0) > 0:
             cost = float(pos["cost"] or 0) / float(pos["grams"])
-    tid = db.execute(
-        "INSERT INTO trades(user_id, date, ts, grams, amount, price, kind, note, cost, created_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (user["id"], date, ts or None, float(body.grams), float(body.amount),
-         float(price), kind, body.note.strip(), cost, db.ts_text()),
-    )
+        _apply_to_position(conn, uid, grams, amount, kind)
+        tid = conn.execute(
+            "INSERT INTO trades(user_id, date, ts, grams, amount, price, kind, note, cost, created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (uid, date, ts or None, grams, amount, float(price), kind,
+             body.note.strip(), cost, db.ts_text()),
+        ).lastrowid
+
     try:
         from ..engine import engine
         engine.refresh_users()
@@ -106,14 +163,20 @@ def add_trade(body: TradeIn, user=Depends(auth.current_user)):
         pass
     row = db.fetch_one(
         "SELECT id, date, ts, grams, amount, price, kind, note, cost, created_at "
-        "FROM trades WHERE id=? AND user_id=?", (tid, user["id"]))
+        "FROM trades WHERE id=? AND user_id=?", (tid, uid))
     return _enrich([row])[0]
 
 
 @router.delete("/{trade_id}")
 def delete_trade(trade_id: int, user=Depends(auth.current_user)):
-    n = db.execute_rowcount("DELETE FROM trades WHERE id=? AND user_id=?",
-                            (trade_id, user["id"]))
-    if n == 0:
-        raise HTTPException(404, "记录不存在")
+    uid = user["id"]
+    with db.transaction() as conn:
+        r = conn.execute(
+            "SELECT id, grams, amount, kind, cost FROM trades "
+            "WHERE id=? AND user_id=?", (trade_id, uid)).fetchone()
+        if r is None:
+            raise HTTPException(404, "记录不存在")
+        _revert_position(conn, uid, float(r["grams"]), float(r["amount"]),
+                         r["kind"], float(r["cost"] or 0))
+        conn.execute("DELETE FROM trades WHERE id=? AND user_id=?", (trade_id, uid))
     return {"ok": True}
