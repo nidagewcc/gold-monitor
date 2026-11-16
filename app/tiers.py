@@ -6,15 +6,23 @@ from datetime import datetime
 from .constants import TRADE_CLOSE_MIN, TRADE_OPEN_MIN
 
 
-def is_trade_hours(now=None):
-    """当前是否处于积存金交易时段（本地时间 9:10-22:20，含起点不含终点）。"""
+def is_trade_day(now=None):
+    """是否为交易日：周一至周五（节假日无法本地判断，由接口有无报价兜底）。"""
     now = now or datetime.now()
+    return now.weekday() < 5
+
+
+def is_trade_hours(now=None):
+    """当前是否处于积存金交易时段（周一至周五本地时间 9:10-22:20，含起点不含终点）。"""
+    now = now or datetime.now()
+    if not is_trade_day(now):
+        return False
     cur = now.hour * 60 + now.minute
     return TRADE_OPEN_MIN <= cur < TRADE_CLOSE_MIN
 
 
 def in_trade_session(hm):
-    """积存金交易时段：周一至周五 9:10-22:20（节假日无法本地判断，由接口有无报价兜底）。"""
+    """交易时段时间窗 9:10-22:20；星期由调用方按 is_trade_day 另行判断。"""
     return "09:10" <= hm <= "22:20"
 
 

@@ -4,6 +4,15 @@
 纯函数，不依赖数据库，便于单测。
 """
 from .constants import REDEEM_FEE_RATE
+from datetime import datetime
+
+
+def _is_weekday(date_str):
+    """YYYY-MM-DD 是否为周一至周五（节假日无法本地判断，由接口有无报价兜底）。"""
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").weekday() < 5
+    except (ValueError, TypeError):
+        return True
 
 
 def daily_pl_rows(settles, est_daily, trades, total_grams,
@@ -27,10 +36,13 @@ def daily_pl_rows(settles, est_daily, trades, total_grams,
       当日有买卖时，不能用「期末持仓 × 价差」——那样新买的克数会被当成
       全天持有，结果与支付宝对不上（例如 11-12 买 7.15 克，误差约 190 元）。
     """
-    est_close = {r[0]: float(r[2]) for r in (est_daily or [])}
+    est_close = {r[0]: float(r[2]) for r in (est_daily or [])
+                 if _is_weekday(str(r[0])[:10])}
     close = {}
     est_flag = {}
     for d, p in (settles or {}).items():
+        if not _is_weekday(str(d)[:10]):
+            continue  # 周六日不是交易日，即使存在日结价也不生成盈亏行
         close[d] = float(p)
         est_flag[d] = False
     for d, p in est_close.items():
@@ -41,7 +53,10 @@ def daily_pl_rows(settles, est_daily, trades, total_grams,
         return {}
 
     dates = sorted(close)
-    dates2 = sorted(set(dates + [today])) if today and today not in close else dates
+    if today and today not in close and _is_weekday(today):
+        dates2 = sorted(set(dates + [today]))
+    else:
+        dates2 = dates
 
     # 买卖按交易日归集；非交易日成交顺延到之后首个有行情日
     buy_g, buy_a, sell_g, sell_a = {}, {}, {}, {}

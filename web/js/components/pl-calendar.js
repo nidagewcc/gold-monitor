@@ -91,7 +91,7 @@ window.PlCalendar = {
       if (Math.abs(n) >= 10000) return `${n >= 0 ? "+" : ""}${(n / 10000).toFixed(2)}万`;
       return `${n >= 0 ? "+" : ""}${n.toFixed(0)}`;
     },
-    weekday(ds) { return "一二三四五六日"[new Date(ds + "T00:00:00").getDay()]; },
+    weekday(ds) { return "日一二三四五六"[new Date(ds + "T00:00:00").getDay()]; },
   },
   template: `
     <div class="card panel">

@@ -161,6 +161,8 @@ class Engine:
 
     def _in_poll_window(self):
         now = now_cn()
+        if now.weekday() >= 5:
+            return False  # 周六日休市，不轮询、不定格日结价
         cur = now.hour * 60 + now.minute
         day = now.strftime("%Y-%m-%d")
         if TRADE_OPEN_MIN <= cur < TRADE_CLOSE_MIN:
