@@ -267,8 +267,7 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .pos-card { padding: 20px 22px; display: flex; flex-direction: column; }
 .card-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .card-title h3 { margin: 0; font-size: 15px; font-weight: 700; }
-.pos-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 12px; }
-.pos-card .pos-grid { flex: 1; align-content: space-between; }
+.pos-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 16px; }
 .pos-item .k { font-size: 12px; color: var(--txt-3); }
 .pos-item .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .pos-pnl { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -384,7 +383,7 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .panel + .panel { margin-top: 18px; }
 
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; align-items: stretch; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; }
 .grid2 > .card { display: flex; flex-direction: column; }
 .grid2 > .card > .hint:last-child { margin-top: auto; }
 .grid2 > .card > .empty { flex: 1; display: flex; align-items: center; justify-content: center; }
@@ -563,6 +562,7 @@ table.data th.op-col { text-align: right; }
   .panel { padding: 16px; }
   .form-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .grid2 { grid-template-columns: 1fr; }
+  .pos-grid { grid-template-columns: 1fr 1fr; }
   .cal-cell { min-height: 54px; padding: 5px 6px; }
   .cal-cell .pl { font-size: 11px; }
   .chart-box { height: 320px; }
