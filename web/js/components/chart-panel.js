@@ -18,6 +18,8 @@ window.ChartPanel = {
       trendDate: "",
       chart: null,
       timer: null,
+      // 代际令牌：每次取数自增，过期请求返回后直接丢弃，防止慢响应覆盖新模式的数据
+      loadSeq: 0,
     };
   },
   computed: {
@@ -104,16 +106,26 @@ window.ChartPanel = {
       });
       return { buy, sell };
     },
-    setMode(m) { if (this.mode !== m) { this.mode = m; } },
+    setMode(m) {
+      if (this.mode === m) return;
+      this.mode = m;
+      // 切模式后 series 结构（面积、散点数量、类目轴长度）变化大，先销毁旧实例，
+      // 让下一次 draw 全新 init，规避 notMerge 下旧 series 残留引发的 ECharts 内部 reset 异常
+      if (this.chart) { this.chart.dispose(); this.chart = null; }
+    },
     async load(quiet) {
+      // 每次取数领取代际令牌：若期间又发起新的取数（切模式/刷新/定时器），本请求即为过期请求
+      const seq = ++this.loadSeq;
       if (!quiet) { this.loading = true; this.error = ""; }
       try {
         if (this.mode === "trend") {
           const d = await api.get("/api/market/chart?mode=trend", 45000);
+          if (seq !== this.loadSeq) return;
           this.fullLabels = [];
           this.applyTrend(d);
         } else if (this.mode === "daily") {
           const d = await api.get("/api/market/chart?mode=daily", 45000);
+          if (seq !== this.loadSeq) return;
           const rows = d.rows || [];
           this.fullLabels = rows.map((r) => r[0]);
           this.labels = rows.map((r) => r[0].slice(5));
@@ -122,6 +134,7 @@ window.ChartPanel = {
         } else {
           const q = this.localDay ? `&day=${this.localDay}` : "";
           const d = await api.get(`/api/market/chart?mode=local${q}`, 45000);
+          if (seq !== this.loadSeq) return;
           this.fullLabels = [];
           this.localDays = d.days || [];
           this.localDay = d.day || "";
@@ -131,14 +144,18 @@ window.ChartPanel = {
           this.preClose = null;
         }
       } catch (e) {
+        if (seq !== this.loadSeq) return;
         this.error = e.message;
         this.labels = [];
         this.values = [];
       } finally {
+        // 过期请求不再触碰任何渲染状态（loading 由最新请求的 finally 负责收尾）
+        if (seq !== this.loadSeq) return;
         this.loading = false;
         // v-show 刚从 display:none 恢复，单帧 nextTick 时 clientHeight 可能仍为 0；
         // 用双 requestAnimationFrame 等浏览器完成布局后再 init/draw，否则 draw 会被尺寸守卫拦下
         this.$nextTick(() => requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (seq !== this.loadSeq) return;
           if (this.chart) this.chart.resize();
           this.draw();
         })));
@@ -214,7 +231,7 @@ window.ChartPanel = {
           itemStyle: { color: col("--down"), borderColor: col("--card"), borderWidth: 1 },
         });
       }
-      this.chart.setOption({
+      const opt = {
         animation: false,
         grid: { left: 58, right: 72, top: 24, bottom: 40 },
         tooltip: {
@@ -269,7 +286,16 @@ window.ChartPanel = {
             data: marks,
           },
         }, ...extra],
-      }, true);
+      };
+      try {
+        this.chart.setOption(opt, true);
+      } catch (e) {
+        // 实例内部状态损坏时（旧 series 残留导致 reset 异常），重建实例后重试一次
+        console.error("走势图渲染失败，重建实例后重试：", e);
+        this.chart.dispose();
+        this.chart = echarts.init(el);
+        this.chart.setOption(opt, true);
+      }
     },
     rgba(hex, a) {
       const h = hex.replace("#", "");
