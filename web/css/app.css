@@ -376,7 +376,8 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: stretch; }
-.grid2 > .card { display: flex; flex-direction: column; }
+/* margin-top:0 重置通用 .panel+.panel 规则：grid 内间距统一交给 gap，避免并排卡被顶下、单列间距翻倍 */
+.grid2 > .card { display: flex; flex-direction: column; margin-top: 0; }
 .grid2 > .card > .calc-result { flex: 1; }
 .grid2 > .card > .hint:last-child { margin-top: auto; }
 .grid2 > .card > .empty { flex: 1; display: flex; align-items: center; justify-content: center; }
