@@ -1,4 +1,4 @@
-/* 持仓卡：按积存金赎回价估值；支持编辑持仓与隐私模式切换 */
+/* 持仓卡：按积存金赎回价估值；累计浮动盈亏 + 今日实时盈亏；支持编辑与隐私模式 */
 window.PositionCard = {
   props: ["position", "sellPrice", "privacy"],
   emits: ["saved"],
@@ -9,12 +9,32 @@ window.PositionCard = {
     gramsNum() { return Number((this.position && this.position.grams) || 0); },
     costNum() { return Number((this.position && this.position.cost) || 0); },
     sell() { return Number(this.sellPrice || 0); },
+    tctx() { return (this.position && this.position.today) || null; },
     ready() { return this.gramsNum > 0 && this.sell > 0; },
     mv() { return this.gramsNum * this.sell; },
     pl() { return this.mv - this.costNum; },
     costPx() { return this.gramsNum > 0 ? this.costNum / this.gramsNum : 0; },
     pct() { return this.costNum > 0 ? (this.pl / this.costNum) * 100 : 0; },
     plCls() { return this.pl >= 0 ? "up" : "down"; },
+    // 今日盈亏：盘中由前端按实时价重算（口径同后端 daily_pl_rows），收盘用后端结果
+    todayPl() {
+      const t = this.tctx;
+      if (!t) return null;
+      if (!t.in_session) return { value: Number(t.pl || 0), pct: null, live: false };
+      const open = Number(t.grams_open || 0);
+      const buyG = Number(t.buy_g || 0);
+      const sellG = Number(t.sell_g || 0);
+      const buyA = Number(t.buy_a || 0);
+      const sellA = Number(t.sell_a || 0);
+      const prev = Number(t.prev_close || 0);
+      const feeRate = Number(t.fee_rate || 0);
+      if (!(this.sell > 0) || !(prev > 0)) return null;
+      const held = open + buyG - sellG;
+      const sellNet = sellA * (1 - feeRate);
+      const value = held * this.sell - open * prev - buyA + sellNet;
+      const base = open * prev;
+      return { value, pct: base > 0 ? (value / base) * 100 : null, live: true };
+    },
   },
   methods: {
     money(v) {
@@ -72,7 +92,11 @@ window.PositionCard = {
 
       <template v-else>
         <div v-if="privacy">
-          <div class="pos-grid">
+          <div class="pos-day">
+            <div class="k">今日盈亏<span v-if="todayPl && todayPl.live" class="live-dot"></span></div>
+            <div class="v">****</div>
+          </div>
+          <div class="pos-grid" style="margin-top:14px">
             <div class="pos-item"><div class="k">持有克数</div><div class="v">****</div></div>
             <div class="pos-item"><div class="k">预估市值</div><div class="v">****</div></div>
             <div class="pos-item"><div class="k">浮动盈亏</div><div class="v">****</div></div>
@@ -83,7 +107,19 @@ window.PositionCard = {
           </div>
         </div>
         <template v-else>
-          <div class="pos-pnl num" :class="plCls">
+          <div class="pos-day" :class="todayPl ? (todayPl.value >= 0 ? 'up' : 'down') : ''">
+            <div class="k">
+              今日盈亏<span v-if="todayPl && todayPl.live" class="live-dot" title="随实时赎回价跳动"></span>
+              <span v-if="todayPl && !todayPl.live" class="muted" style="font-weight:400"> · 已收盘</span>
+            </div>
+            <div class="v num" v-if="todayPl">
+              {{ sign(todayPl.value) }}{{ money(todayPl.value) }} 元
+              <span v-if="todayPl.pct !== null" class="pct">（{{ sign(todayPl.pct) }}{{ todayPl.pct.toFixed(2) }}%）</span>
+            </div>
+            <div class="v num muted" v-else>--</div>
+          </div>
+          <div class="pos-pnl num" :class="plCls" style="margin-top:14px">
+            <span class="pnl-label">累计浮动盈亏</span>
             {{ sign(pl) }}{{ money(pl) }} 元
             <span style="font-size:14px;font-weight:600">（{{ sign(pct) }}{{ pct.toFixed(2) }}%）</span>
           </div>

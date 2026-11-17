@@ -28,27 +28,21 @@
   </nav>
 
   <main class="app-wrap">
-    <section v-if="tab === 'market'" class="grid">
-      <div class="col">
-        <price-card :prices="s.snapshot.prices"
-                    :sources="sources"
-                    :source="source"
-                    :time="s.snapshot.time"
-                    :date="s.snapshot.date"
-                    :high="s.snapshot.high"
-                    :low="s.snapshot.low"
-                    :market="market"
-                    :stale="s.stale"></price-card>
-      </div>
-      <div class="col">
-        <position-card :position="s.position" :sell-price="sellPrice" :privacy="privacy"></position-card>
-      </div>
-      <div class="col" style="grid-column:1 / -1">
-        <div class="grid2">
-          <calc-panel :sell-price="sellPrice" :position="s.position" :privacy="privacy"></calc-panel>
-          <avg-down-panel :sell-price="sellPrice" :buy-price="buyPrice"
-                          :position="s.position" :privacy="privacy"></avg-down-panel>
-        </div>
+    <section v-if="tab === 'market'" class="market-flow">
+      <price-card :prices="s.snapshot.prices"
+                  :sources="sources"
+                  :source="source"
+                  :time="s.snapshot.time"
+                  :date="s.snapshot.date"
+                  :high="s.snapshot.high"
+                  :low="s.snapshot.low"
+                  :market="market"
+                  :stale="s.stale"></price-card>
+      <position-card :position="s.position" :sell-price="sellPrice" :privacy="privacy"></position-card>
+      <div class="grid2">
+        <calc-panel :sell-price="sellPrice" :position="s.position" :privacy="privacy"></calc-panel>
+        <avg-down-panel :sell-price="sellPrice" :buy-price="buyPrice"
+                        :position="s.position" :privacy="privacy"></avg-down-panel>
       </div>
     </section>
 

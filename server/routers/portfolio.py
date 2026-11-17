@@ -1,19 +1,72 @@
 # -*- coding: utf-8 -*-
-"""持仓：克数与累计成本。"""
+"""持仓：克数、累计成本，以及今日实时盈亏上下文。"""
 from fastapi import APIRouter, Depends
 
+from app import tiers
+from app.constants import REDEEM_FEE_RATE
+from app.portfolio import daily_pl_rows
+from app.timeutil import now_cn, today_str
+
 from .. import auth, db
+from ..engine import engine
 from ..schemas import PositionIn
 
 router = APIRouter(prefix="/api/position", tags=["position"])
+
+
+def _today_pl_ctx(uid):
+    """今日盈亏上下文。盘中返回基准数据由前端按实时价跳动计算；
+    收盘/周末无实时价时，直接给后端按日结价算好的结果。无基准（首个交易日
+    建仓等）返回 None。
+    """
+    now = now_cn()
+    today = today_str()
+    hm = now.strftime("%H:%M")
+
+    settles = {r["day"]: float(r["price"])
+               for r in db.fetch_all("SELECT day, price FROM settles")}
+    trades = db.fetch_all(
+        "SELECT date, grams, amount, kind FROM trades WHERE user_id=? ORDER BY date, id",
+        (uid,))
+    pos = db.fetch_one("SELECT grams FROM positions WHERE user_id=?", (uid,))
+    grams = float(pos["grams"]) if pos else 0.0
+
+    live = None
+    if now.weekday() < 5 and tiers.in_trade_session(hm):
+        live = ((engine.latest or {}).get("prices") or {}).get("jicun_sell")
+
+    rows = daily_pl_rows(settles, [], trades, grams,
+                         live_sell=live, today=today, now_hm=hm)
+    row = rows.get(today)
+    if not row:
+        return None
+
+    fee_rate = REDEEM_FEE_RATE
+    if live:
+        # 盘中：给前端基准数据，随 SSE 实时价重算（口径同 daily_pl_rows）
+        return {
+            "in_session": True,
+            "prev_close": row["prev"],
+            "grams_open": row["grams_open"],
+            "buy_g": row["buy_g"],
+            "buy_a": row["buy_cost"],
+            "sell_g": row["sell_g"],
+            "sell_a": row["sell_cost"],
+            "fee_rate": fee_rate,
+        }
+    # 非盘中：日结价已定格，后端直接给结果，前端原样展示
+    return {"in_session": False, "pl": round(row["pl"], 2)}
 
 
 def position_of(uid):
     r = db.fetch_one("SELECT grams, cost FROM positions WHERE user_id=?", (uid,))
     if not r:
         db.execute("INSERT INTO positions(user_id) VALUES(?)", (uid,))
-        return {"grams": 0.0, "cost": 0.0}
-    return {"grams": float(r["grams"]), "cost": float(r["cost"])}
+        base = {"grams": 0.0, "cost": 0.0}
+    else:
+        base = {"grams": float(r["grams"]), "cost": float(r["cost"])}
+    base["today"] = _today_pl_ctx(uid)
+    return base
 
 
 @router.get("")
@@ -30,7 +83,6 @@ def put_position(body: PositionIn, user=Depends(auth.current_user)):
         (uid, max(0.0, float(body.grams)), max(0.0, float(body.cost))),
     )
     try:
-        from ..engine import engine
         engine.refresh_users()
     except Exception:
         pass
