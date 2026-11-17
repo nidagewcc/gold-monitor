@@ -270,30 +270,22 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .pos-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 16px; }
 .pos-item .k { font-size: 12px; color: var(--txt-3); }
 .pos-item .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.pos-pnl { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.pos-pnl .pnl-label {
-  display: block;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--txt-3);
-  margin-bottom: 2px;
-}
-
-/* 今日实时盈亏条 */
-.pos-day {
+/* 盈亏双盒：今日盈亏 / 累计浮动盈亏，统一视觉语言 */
+.pl-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.pl-box {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  flex-direction: column;
+  gap: 6px;
   padding: 12px 14px;
   border-radius: 12px;
   background: var(--card-2);
 }
-.pos-day .k { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--txt-2); }
-.pos-day .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.pos-day .v .pct { font-size: 13px; font-weight: 600; }
-.pos-day.up .v { color: var(--up); }
-.pos-day.down .v { color: var(--down); }
+.pl-box .k { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--txt-3); }
+.pl-box .k .muted { color: var(--txt-3); font-weight: 400; }
+.pl-box .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.3; }
+.pl-box .v .pct { font-size: 13px; font-weight: 600; }
+.pl-box.up .v { color: var(--up); }
+.pl-box.down .v { color: var(--down); }
 .live-dot {
   width: 7px;
   height: 7px;
@@ -383,8 +375,9 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .panel + .panel { margin-top: 18px; }
 
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: stretch; }
 .grid2 > .card { display: flex; flex-direction: column; }
+.grid2 > .card > .calc-result { flex: 1; }
 .grid2 > .card > .hint:last-child { margin-top: auto; }
 .grid2 > .card > .empty { flex: 1; display: flex; align-items: center; justify-content: center; }
 .stack { display: flex; flex-direction: column; gap: 14px; }
@@ -563,6 +556,8 @@ table.data th.op-col { text-align: right; }
   .form-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .grid2 { grid-template-columns: 1fr; }
   .pos-grid { grid-template-columns: 1fr 1fr; }
+  .pl-grid { grid-template-columns: 1fr; }
+  .pl-box .v { font-size: 17px; }
   .cal-cell { min-height: 54px; padding: 5px 6px; }
   .cal-cell .pl { font-size: 11px; }
   .chart-box { height: 320px; }

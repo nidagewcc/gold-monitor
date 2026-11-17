@@ -99,14 +99,20 @@ window.PositionCard = {
 
       <template v-else>
         <div v-if="privacy">
-          <div class="pos-day">
-            <div class="k">今日盈亏<span v-if="todayPl && todayPl.live" class="live-dot"></span></div>
-            <div class="v">****</div>
+          <div class="pl-grid">
+            <div class="pl-box">
+              <div class="k">今日盈亏<span v-if="todayPl && todayPl.live" class="live-dot"></span></div>
+              <div class="v num">****</div>
+            </div>
+            <div class="pl-box">
+              <div class="k">累计浮动盈亏</div>
+              <div class="v num">****</div>
+            </div>
           </div>
           <div class="pos-grid" style="margin-top:14px">
             <div class="pos-item"><div class="k">持有克数</div><div class="v">****</div></div>
             <div class="pos-item"><div class="k">预估市值</div><div class="v">****</div></div>
-            <div class="pos-item"><div class="k">浮动盈亏</div><div class="v">****</div></div>
+            <div class="pos-item"><div class="k">累计成本</div><div class="v">****</div></div>
             <div class="pos-item"><div class="k">成本价</div><div class="v">****</div></div>
           </div>
           <div class="muted" style="margin-top:10px;font-size:12px">
@@ -114,22 +120,26 @@ window.PositionCard = {
           </div>
         </div>
         <template v-else>
-          <div class="pos-day" :class="todayPl ? (todayPl.value >= 0 ? 'up' : 'down') : ''">
-            <div class="k">
-              今日盈亏<span v-if="todayPl && todayPl.live" class="live-dot" title="随实时赎回价跳动"></span>
-              <span v-if="todayPl && todayPl.settled" class="muted" style="font-weight:400"> · 已收盘</span>
-              <span v-else-if="todayPl && !todayPl.live" class="muted" style="font-weight:400"> · 预估</span>
+          <div class="pl-grid">
+            <div class="pl-box" :class="todayPl ? (todayPl.value >= 0 ? 'up' : 'down') : ''">
+              <div class="k">
+                今日盈亏<span v-if="todayPl && todayPl.live" class="live-dot" title="随实时赎回价跳动"></span>
+                <span v-if="todayPl && todayPl.settled" class="muted"> · 已收盘</span>
+                <span v-else-if="todayPl && !todayPl.live" class="muted"> · 预估</span>
+              </div>
+              <div class="v num" v-if="todayPl">
+                {{ sign(todayPl.value) }}{{ money(todayPl.value) }} 元
+                <span v-if="todayPl.pct !== null" class="pct">（{{ sign(todayPl.pct) }}{{ todayPl.pct.toFixed(2) }}%）</span>
+              </div>
+              <div class="v num muted" v-else>--</div>
             </div>
-            <div class="v num" v-if="todayPl">
-              {{ sign(todayPl.value) }}{{ money(todayPl.value) }} 元
-              <span v-if="todayPl.pct !== null" class="pct">（{{ sign(todayPl.pct) }}{{ todayPl.pct.toFixed(2) }}%）</span>
+            <div class="pl-box" :class="plCls">
+              <div class="k">累计浮动盈亏</div>
+              <div class="v num">
+                {{ sign(pl) }}{{ money(pl) }} 元
+                <span class="pct">（{{ sign(pct) }}{{ pct.toFixed(2) }}%）</span>
+              </div>
             </div>
-            <div class="v num muted" v-else>--</div>
-          </div>
-          <div class="pos-pnl num" :class="plCls" style="margin-top:14px">
-            <span class="pnl-label">累计浮动盈亏</span>
-            {{ sign(pl) }}{{ money(pl) }} 元
-            <span style="font-size:14px;font-weight:600">（{{ sign(pct) }}{{ pct.toFixed(2) }}%）</span>
           </div>
           <div class="pos-grid" style="margin-top:14px">
             <div class="pos-item">
