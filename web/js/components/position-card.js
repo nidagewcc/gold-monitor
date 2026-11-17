@@ -16,11 +16,13 @@ window.PositionCard = {
     costPx() { return this.gramsNum > 0 ? this.costNum / this.gramsNum : 0; },
     pct() { return this.costNum > 0 ? (this.pl / this.costNum) * 100 : 0; },
     plCls() { return this.pl >= 0 ? "up" : "down"; },
-    // 今日盈亏：盘中由前端按实时价重算（口径同后端 daily_pl_rows），收盘用后端结果
+    // 今日盈亏：盘中随实时价跳动；实时价暂缺时按当前赎回价预估；收盘用后端日结结果
     todayPl() {
       const t = this.tctx;
       if (!t) return null;
-      if (!t.in_session) return { value: Number(t.pl || 0), pct: null, live: false };
+      if (!t.in_session && t.pl !== undefined) {
+        return { value: Number(t.pl || 0), pct: null, live: false, settled: true };
+      }
       const open = Number(t.grams_open || 0);
       const buyG = Number(t.buy_g || 0);
       const sellG = Number(t.sell_g || 0);
@@ -33,7 +35,12 @@ window.PositionCard = {
       const sellNet = sellA * (1 - feeRate);
       const value = held * this.sell - open * prev - buyA + sellNet;
       const base = open * prev;
-      return { value, pct: base > 0 ? (value / base) * 100 : null, live: true };
+      return {
+        value,
+        pct: base > 0 ? (value / base) * 100 : null,
+        live: t.in_session === true,
+        settled: t.pl !== undefined,
+      };
     },
   },
   methods: {
@@ -110,7 +117,8 @@ window.PositionCard = {
           <div class="pos-day" :class="todayPl ? (todayPl.value >= 0 ? 'up' : 'down') : ''">
             <div class="k">
               今日盈亏<span v-if="todayPl && todayPl.live" class="live-dot" title="随实时赎回价跳动"></span>
-              <span v-if="todayPl && !todayPl.live" class="muted" style="font-weight:400"> · 已收盘</span>
+              <span v-if="todayPl && todayPl.settled" class="muted" style="font-weight:400"> · 已收盘</span>
+              <span v-else-if="todayPl && !todayPl.live" class="muted" style="font-weight:400"> · 预估</span>
             </div>
             <div class="v num" v-if="todayPl">
               {{ sign(todayPl.value) }}{{ money(todayPl.value) }} 元
