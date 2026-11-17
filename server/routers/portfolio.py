@@ -43,8 +43,14 @@ def _today_pl_ctx(uid):
     pos = db.fetch_one("SELECT grams FROM positions WHERE user_id=?", (uid,))
     grams = float(pos["grams"]) if pos else 0.0
 
+    # 交易日实时价暂缺（开盘前/轮询空窗）时，用最近日结价作占位驱动生成今日行，
+    # 仅取基准字段；真实估值由前端按当前赎回价计算并标注「预估」。
+    driver_live = live
+    if is_weekday and driver_live is None and settles:
+        driver_live = settles[max(settles)]
+
     rows = daily_pl_rows(settles, [], trades, grams,
-                         live_sell=live, today=today, now_hm=hm)
+                         live_sell=driver_live, today=today, now_hm=hm)
     row = rows.get(today)
     if not row:
         return None
