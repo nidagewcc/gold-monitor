@@ -56,8 +56,13 @@ window.ChartPanel = {
   },
   methods: {
     resize() {
-      if (this.chart) this.chart.resize();
-      else this.scheduleDraw();
+      // 实例损坏时 resize 会抛错，降级为重建式重绘而不是让异常冒泡
+      if (this.chart && !this.chart.isDisposed()) {
+        try { this.chart.resize(); }
+        catch (e) { this.chart = null; this.scheduleDraw(); }
+      } else {
+        this.scheduleDraw();
+      }
     },
     async loadPlans() {
       try {
@@ -170,23 +175,17 @@ window.ChartPanel = {
     },
     // 在下一帧 DOM 布局完成后重绘；同一轮内多次触发只排一次，避免重复 init/setOption
     scheduleDraw() {
-      if (this.drawQueued) { console.log("[DBG] scheduleDraw skip: already queued"); return; }
+      if (this.drawQueued) return;
       this.drawQueued = true;
-      console.log("[DBG] scheduleDraw enqueue", { mode: this.mode, loading: this.loading, vlen: this.values.length });
       this.$nextTick(() => requestAnimationFrame(() => requestAnimationFrame(() => {
         this.drawQueued = false;
-        const el = this.$refs.box;
-        console.log("[DBG] raf fire", {
-          loading: this.loading, error: this.error, vlen: this.values.length,
-          hasEl: !!el, w: el && el.clientWidth, h: el && el.clientHeight,
-          hasChart: !!this.chart, chartDisposed: this.chart && this.chart.isDisposed()
-        });
         if (this.loading || this.error || !this.values.length) return;
+        const el = this.$refs.box;
         // 容器尚不可见（display:none 或尺寸为 0）时跳过本次，等待下一次数据/状态变化再补
         if (!el || !el.clientWidth || !el.clientHeight) return;
-        if (this.chart) this.chart.resize();
+        // 仅负责触发 draw；resize 与实例损坏兜底都收敛在 draw 内部，
+        // 避免 resize 抛异常中断回调导致 setOption 永远不执行（本地分一切日期图不更新的根因）
         this.draw();
-        console.log("[DBG] draw called, instLen=", echarts.getInstanceByDom(el).getOption().series[0].data.length);
       })));
     },
     applyTrend(d) {
@@ -210,6 +209,16 @@ window.ChartPanel = {
       if (!el || !el.clientWidth || !el.clientHeight) return;
       if (!this.chart || this.chart.isDisposed()) {
         this.chart = echarts.init(el);
+      } else {
+        // 容器尺寸可能变化，先 resize 对齐。notMerge 切换 series 结构后，
+        // 残留 model 可能让 resize 在内部 reset 时抛 undefined.type；
+        // 一旦抛错说明实例已损坏，dispose 后重建，保证下面的 setOption 在干净实例上执行
+        try {
+          this.chart.resize();
+        } catch (e) {
+          try { this.chart.dispose(); } catch (_) { /* 忽略已失效实例 */ }
+          this.chart = echarts.init(el);
+        }
       }
       const css = getComputedStyle(document.documentElement);
       const col = (n) => css.getPropertyValue(n).trim() || "#888";
