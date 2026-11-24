@@ -170,16 +170,23 @@ window.ChartPanel = {
     },
     // 在下一帧 DOM 布局完成后重绘；同一轮内多次触发只排一次，避免重复 init/setOption
     scheduleDraw() {
-      if (this.drawQueued) return;
+      if (this.drawQueued) { console.log("[DBG] scheduleDraw skip: already queued"); return; }
       this.drawQueued = true;
+      console.log("[DBG] scheduleDraw enqueue", { mode: this.mode, loading: this.loading, vlen: this.values.length });
       this.$nextTick(() => requestAnimationFrame(() => requestAnimationFrame(() => {
         this.drawQueued = false;
-        if (this.loading || this.error || !this.values.length) return;
         const el = this.$refs.box;
+        console.log("[DBG] raf fire", {
+          loading: this.loading, error: this.error, vlen: this.values.length,
+          hasEl: !!el, w: el && el.clientWidth, h: el && el.clientHeight,
+          hasChart: !!this.chart, chartDisposed: this.chart && this.chart.isDisposed()
+        });
+        if (this.loading || this.error || !this.values.length) return;
         // 容器尚不可见（display:none 或尺寸为 0）时跳过本次，等待下一次数据/状态变化再补
         if (!el || !el.clientWidth || !el.clientHeight) return;
         if (this.chart) this.chart.resize();
         this.draw();
+        console.log("[DBG] draw called, instLen=", echarts.getInstanceByDom(el).getOption().series[0].data.length);
       })));
     },
     applyTrend(d) {
