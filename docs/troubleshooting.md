@@ -58,6 +58,8 @@ const o = echarts.getInstanceByDom(el).getOption();
 - Exec 拼接浏览器脚本时 `\n` 容易被错误转义导致 `Invalid or unexpected token`，多行用 `lines.join(String.fromCharCode(10))` 规避。
 - 读取 hook 捕获的 option 时，series 数组要先 `.filter(Boolean)` 再 map，压缩/空洞元素会让读取脚本自己抛错。
 
+> 后续进展（2026-11-24，见第五节）：本节的 `loadSeq` 代际令牌只解决了「慢响应覆盖新数据」，并未覆盖「数据已正确写入但 ECharts 实例没重绘」这一类问题；`setMode` 里 dispose 重建也只在切模式时生效，本地分一切日期复用同一实例，最终暴露的是 `resize()` 抛异常中断渲染。排查同类「图不更新」时，务必先区分是**数据没写对**还是**写对了没画出来**。
+
 ---
 
 ## 二、grid2 卡片间距与通用 .panel + .panel 规则（2026-11-17，commit ba79f8a）
@@ -76,7 +78,7 @@ const o = echarts.getInstanceByDom(el).getOption();
 
 ### 静态资源破缓存
 
-前端无构建，`web/index.html` 里所有 CSS/JS 引用带 `?v=YYYYMMDDx` 查询串。任何 `web/` 下文件改动后，必须把 index.html 中**全部**资源版本号统一递增（当前 `20261117d`），否则浏览器沿用旧缓存、线上看似「没生效」。
+前端无构建，`web/index.html` 里所有 CSS/JS 引用带 `?v=YYYYMMDDx` 查询串。任何 `web/` 下文件改动后，必须把 index.html 中对应资源的版本号递增（当前 chart-panel.js 为 `20261124d`），否则浏览器沿用旧缓存、线上看似「没生效」。
 
 ### 部署链路（192.168.3.103）
 
@@ -98,3 +100,55 @@ const o = echarts.getInstanceByDom(el).getOption();
 ## 四、待处理小项
 
 - `web/js/components/calc-panel.js` 的「全部」按钮填充持仓克数时存在浮点尾巴（如 `53.43000000000001`），建议输出统一 `toFixed(4)`；已向用户提出两次，待拍板。
+
+---
+
+## 五、本地分一切换日期图表不更新 + 首屏卡「正在取数」（2026-11-24，commit 9b35157）
+
+### 现象
+
+本地分时模式下，日期下拉切到别的交易日，标题与下拉选中值都变了，网络请求 200，但 ECharts 画布仍停留在切之前那天的数据，用户感知「本地分时每天长得都一样」。另外首次点进本地分时会一直卡在「正在取数…」，需手动点刷新才出图。控制台在失败瞬间有一条报错：
+
+```
+Uncaught TypeError: Cannot read properties of undefined (reading 'type')
+    at echarts.min.js:45
+```
+
+### 排查链路（关键是先分清「数据错」还是「没重绘」）
+
+1. **后端排除**：`market.py` 的 local 分支按 `day` 参数查 `history` 表，线上库 7 个交易日每天 791 点、价格区间各异；直接 fetch `mode=local&day=2026-11-17` 返回正确。
+2. **请求 URL 取证**：`browser_network_requests` 看到切换后请求**确实带了正确的 `day=2026-11-17`**，推翻了「v-model 时序导致 day 还是旧值」的假设。
+3. **组件 data 取证（决定性）**：通过 `document.getElementById('app').__vue_app__._container._vnode.component` 递归子树找到 ChartPanel 实例，发现响应式 `data.values` 已是 11-17 的 791 点（824.88–834.6），而 `echarts.getInstanceByDom(box).getOption().series[0].data` 还是旧日的 769.14 区间。**数据链路全对，问题在渲染没刷进实例。**
+4. **受控实验**：在同一浏览器上下文手动调一次组件的 `draw()`，图表立刻从 769 跳到 824——证明数据没问题，是自动链路没走到 `setOption`。
+5. **临时埋点定位中断点**：在 `scheduleDraw` 的 RAF 回调里打 `console.log`，复现后看到回调先执行 `this.chart.resize()`，随即抛出上面的 `undefined.type`，异常未捕获、整个回调中断，后面的 `this.draw()` 永远不执行。
+
+> 取证时一个误导点：跨 `browser_evaluate` 调用比较 `proxy.chart === getInstanceByDom(box)` 会得到 false，但两者 `id` 相同、`getDom()` 同指一个节点——这是评估上下文对象包装导致的身份比较失真，**不是真的有两个实例**。判断实例唯一性用 `inst.id` 和 `getDom()`，别用跨上下文的 `===`。
+
+### 根因（三处叠加）
+
+1. **resize 异常中断渲染（主因）**：本地分一切日期复用同一 ECharts 实例（`setMode` 的 dispose 重建只在切模式时触发），notMerge 下 series 结构（散点、markLine、类目长度）变化后内部 model 残留，`resize()` 触发内部 reset 时遍历到失效 series 项抛 `undefined.type`。旧代码在 `scheduleDraw` 里把 `resize()` 放在 `draw()` 之前且无 try/catch，一抛错 `setOption` 就被跳过。
+2. **渲染只靠一次性调度，无补渲染机制**：`load()` 的 finally 用「双 requestAnimationFrame 调一次 draw」，这一帧若被守卫或异常跳过，之后没有任何 watcher/重试再触发，画面永久停留旧图。
+3. **维度令牌 stale 自我污染（首屏卡死）**：旧 `loadToken={mode,day}` 的 `stale()` 依赖 `this.localDay`，而 local 分支会用响应回填 `this.localDay`。首屏进入本地分时 token 捕获的是空 day（data 初始值 `""`），响应回填最新日后 finally 里 `stale()` 判定 `"" !== "2026-11-24"` 为真直接 return，`loading` 永不复位、图不渲染。
+
+### 修复（web/js/components/chart-panel.js）
+
+- **resize 容错并下沉到 draw**：`scheduleDraw` 不再单独 resize，只负责触发 `draw()`；`draw()` 内对已存在实例先 try `resize()`，抛错即 `dispose()` 后重新 `echarts.init`，保证后续 `setOption` 在干净实例上必然执行。window 的 `resize()` 入口同样 try/catch，失败降级为重建式重绘。
+- **渲染与取数解耦**：新增 `scheduleDraw()`（同轮去重 + 双 RAF 等布局），由 `values/labels/loading/privacy` 的 watcher 统一驱动；只要数据变且容器可见就一定补一次重绘，取代 finally 的一次性调度。
+- **代际控制改回纯序号 `loadSeq`**：每次 load 自增，await 回来后 `seq !== this.loadSeq` 即丢弃，免疫任何字段回写污染，也防旧请求的错误/空数据覆盖新状态。
+- **localDay 仅首屏初始化**：local 分支只在 `this.localDay` 为空时用后端返回的最新日赋值，不再回写覆盖用户已选日期。
+- index.html 版本号一路递增到 `20261124d` 破缓存（期间 b/c 为中间验证版，c 带临时埋点，已在 d 中移除）。
+
+### 验证
+
+通过 ECharts 实例反查 + 组件 data 双向比对（`Math.min(values) === Math.min(instSeriesData)` 即 `match`）：
+
+- 首屏进本地分时不再卡「正在取数」，loading 正常复位、图直接渲染。
+- 11-17 / 11-23 / 11-13 互切，实例数据随日期真实变化（824.88 / 769.14 / 834.38 三个区间分明），每次 `match=true`。
+- 今日分时 / 历史日K / 本地分时三模式互切不回退；刷新按钮后数据保持。
+- `browser_console_messages` 全程零 error、零 warning。
+
+### 教训
+
+- 「图不更新」要先做**数据层与渲染层的分离取证**：读组件响应式 data 对比 ECharts 实例 option，能立刻区分是请求/写入问题还是 setOption 没跑，避免在令牌、v-model 时序等方向上空转（本次前两次修复 loadSeq→loadToken 都改错了层）。
+- 任何在异步回调里、`draw/setOption` 之前的前置调用（典型如 `resize()`）都必须容错，否则一次抛错会让真正的渲染语句永远到不了。
+- 一次性 RAF 调度不可靠，响应式框架里优先用 watcher 驱动渲染，让「数据变 → 必然重绘」成为不变量。
