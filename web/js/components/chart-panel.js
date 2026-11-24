@@ -18,8 +18,8 @@ window.ChartPanel = {
       trendDate: "",
       chart: null,
       timer: null,
-      // 代际令牌：每次取数自增，过期请求返回后直接丢弃，防止慢响应覆盖新模式的数据
-      loadSeq: 0,
+      // 代际令牌：记录当前取数的维度（模式 + 本地日期），维度变化后旧响应直接丢弃
+      loadToken: null,
     };
   },
   computed: {
@@ -114,18 +114,22 @@ window.ChartPanel = {
       if (this.chart) { this.chart.dispose(); this.chart = null; }
     },
     async load(quiet) {
-      // 每次取数领取代际令牌：若期间又发起新的取数（切模式/刷新/定时器），本请求即为过期请求
-      const seq = ++this.loadSeq;
+      // 代际令牌：记录本次请求的取数维度（模式 + 本地日期）。
+      // 仅当维度发生变化（切模式/切日期）时旧响应才过期；同维度的定时器静默刷新不算过期，
+      // 否则本地分一切换日期会被纯序号令牌误杀，导致标题变了图却不更新
+      const token = { mode: this.mode, day: this.localDay };
+      this.loadToken = token;
       if (!quiet) { this.loading = true; this.error = ""; }
+      const stale = () => token.mode !== this.mode || token.day !== this.localDay;
       try {
         if (this.mode === "trend") {
           const d = await api.get("/api/market/chart?mode=trend", 45000);
-          if (seq !== this.loadSeq) return;
+          if (stale()) return;
           this.fullLabels = [];
           this.applyTrend(d);
         } else if (this.mode === "daily") {
           const d = await api.get("/api/market/chart?mode=daily", 45000);
-          if (seq !== this.loadSeq) return;
+          if (stale()) return;
           const rows = d.rows || [];
           this.fullLabels = rows.map((r) => r[0]);
           this.labels = rows.map((r) => r[0].slice(5));
@@ -134,7 +138,7 @@ window.ChartPanel = {
         } else {
           const q = this.localDay ? `&day=${this.localDay}` : "";
           const d = await api.get(`/api/market/chart?mode=local${q}`, 45000);
-          if (seq !== this.loadSeq) return;
+          if (stale()) return;
           this.fullLabels = [];
           this.localDays = d.days || [];
           this.localDay = d.day || "";
@@ -144,18 +148,18 @@ window.ChartPanel = {
           this.preClose = null;
         }
       } catch (e) {
-        if (seq !== this.loadSeq) return;
+        if (stale()) return;
         this.error = e.message;
         this.labels = [];
         this.values = [];
       } finally {
         // 过期请求不再触碰任何渲染状态（loading 由最新请求的 finally 负责收尾）
-        if (seq !== this.loadSeq) return;
+        if (stale()) return;
         this.loading = false;
         // v-show 刚从 display:none 恢复，单帧 nextTick 时 clientHeight 可能仍为 0；
         // 用双 requestAnimationFrame 等浏览器完成布局后再 init/draw，否则 draw 会被尺寸守卫拦下
         this.$nextTick(() => requestAnimationFrame(() => requestAnimationFrame(() => {
-          if (seq !== this.loadSeq) return;
+          if (stale()) return;
           if (this.chart) this.chart.resize();
           this.draw();
         })));
