@@ -18,8 +18,10 @@ window.ChartPanel = {
       trendDate: "",
       chart: null,
       timer: null,
-      // 代际令牌：记录当前取数的维度（模式 + 本地日期），维度变化后旧响应直接丢弃
-      loadToken: null,
+      // 取数代际序号：每次 load 自增，只有最新一次请求允许写响应式状态与渲染，
+      // 旧请求（切模式/切日期/定时器交错产生）回来后一律忽略，避免旧数据或旧错误覆盖新状态
+      loadSeq: 0,
+      drawQueued: false,
     };
   },
   computed: {
@@ -31,7 +33,14 @@ window.ChartPanel = {
   },
   watch: {
     mode() { this.load(); },
-    privacy() { this.draw(); },
+    privacy() { this.scheduleDraw(); },
+    // 数据变化后由 watcher 统一负责重绘，与 load 的取数流程解耦：
+    // 无论 load 的 finally 处于什么时序，只要 values/labels 更新且容器可见，就一定补一次渲染，
+    // 根治“数据已更新但 ECharts 实例停留在旧图”的问题
+    values() { this.scheduleDraw(); },
+    labels() { this.scheduleDraw(); },
+    // loading 由 true 变 false 时容器才从 display:none 恢复，此时再尝试一次，兜住首屏/切模式后的渲染
+    loading(v) { if (!v) this.scheduleDraw(); },
   },
   mounted() {
     window.addEventListener("resize", this.resize);
@@ -48,7 +57,7 @@ window.ChartPanel = {
   methods: {
     resize() {
       if (this.chart) this.chart.resize();
-      else this.draw();
+      else this.scheduleDraw();
     },
     async loadPlans() {
       try {
@@ -60,7 +69,7 @@ window.ChartPanel = {
       try {
         this.trades = await api.get("/api/trades");
       } catch (e) { this.trades = []; }
-      this.$nextTick(() => this.draw());
+      this.scheduleDraw();
     },
     // 把买卖成交映射到当前图的横轴位置
     tradePoints() {
@@ -114,22 +123,20 @@ window.ChartPanel = {
       if (this.chart) { this.chart.dispose(); this.chart = null; }
     },
     async load(quiet) {
-      // 代际令牌：记录本次请求的取数维度（模式 + 本地日期）。
-      // 仅当维度发生变化（切模式/切日期）时旧响应才过期；同维度的定时器静默刷新不算过期，
-      // 否则本地分一切换日期会被纯序号令牌误杀，导致标题变了图却不更新
-      const token = { mode: this.mode, day: this.localDay };
-      this.loadToken = token;
+      // 取数代际：每次 load 自增并捕获本次序号，await 回来后只有“仍是最新请求”才允许写状态。
+      // 用纯序号而非维度对象，避免 local 分支回写 localDay 造成的自我污染（首屏空 day 被回填后误判过期）。
+      const seq = ++this.loadSeq;
+      const isCurrent = () => seq === this.loadSeq;
       if (!quiet) { this.loading = true; this.error = ""; }
-      const stale = () => token.mode !== this.mode || token.day !== this.localDay;
       try {
         if (this.mode === "trend") {
           const d = await api.get("/api/market/chart?mode=trend", 45000);
-          if (stale()) return;
+          if (!isCurrent()) return;
           this.fullLabels = [];
           this.applyTrend(d);
         } else if (this.mode === "daily") {
           const d = await api.get("/api/market/chart?mode=daily", 45000);
-          if (stale()) return;
+          if (!isCurrent()) return;
           const rows = d.rows || [];
           this.fullLabels = rows.map((r) => r[0]);
           this.labels = rows.map((r) => r[0].slice(5));
@@ -138,32 +145,42 @@ window.ChartPanel = {
         } else {
           const q = this.localDay ? `&day=${this.localDay}` : "";
           const d = await api.get(`/api/market/chart?mode=local${q}`, 45000);
-          if (stale()) return;
+          if (!isCurrent()) return;
           this.fullLabels = [];
           this.localDays = d.days || [];
-          this.localDay = d.day || "";
+          // 仅在没有已选日期（首屏进入）时用后端返回的最新日初始化，避免回写覆盖用户刚选择的日期
+          if (!this.localDay) this.localDay = d.day || "";
           const pts = d.points || [];
           this.labels = pts.map((p) => p[0]);
           this.values = pts.map((p) => p[1]);
           this.preClose = null;
         }
       } catch (e) {
-        if (stale()) return;
+        if (!isCurrent()) return;
         this.error = e.message;
         this.labels = [];
         this.values = [];
       } finally {
-        // 过期请求不再触碰任何渲染状态（loading 由最新请求的 finally 负责收尾）
-        if (stale()) return;
+        // 过期请求不触碰任何状态；loading 收尾与重绘都只由最新请求负责
+        if (!isCurrent()) return;
         this.loading = false;
-        // v-show 刚从 display:none 恢复，单帧 nextTick 时 clientHeight 可能仍为 0；
-        // 用双 requestAnimationFrame 等浏览器完成布局后再 init/draw，否则 draw 会被尺寸守卫拦下
-        this.$nextTick(() => requestAnimationFrame(() => requestAnimationFrame(() => {
-          if (stale()) return;
-          if (this.chart) this.chart.resize();
-          this.draw();
-        })));
+        // 重绘已由 values/labels 的 watcher（scheduleDraw）统一驱动，这里不再做一次性调度，
+        // 避免 finally 时序下容器尺寸为 0 导致 draw 被守卫拦下后再无补渲染机会
       }
+    },
+    // 在下一帧 DOM 布局完成后重绘；同一轮内多次触发只排一次，避免重复 init/setOption
+    scheduleDraw() {
+      if (this.drawQueued) return;
+      this.drawQueued = true;
+      this.$nextTick(() => requestAnimationFrame(() => requestAnimationFrame(() => {
+        this.drawQueued = false;
+        if (this.loading || this.error || !this.values.length) return;
+        const el = this.$refs.box;
+        // 容器尚不可见（display:none 或尺寸为 0）时跳过本次，等待下一次数据/状态变化再补
+        if (!el || !el.clientWidth || !el.clientHeight) return;
+        if (this.chart) this.chart.resize();
+        this.draw();
+      })));
     },
     applyTrend(d) {
       const all = d.points || [];
